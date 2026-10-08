@@ -21,6 +21,7 @@ from apscheduler import (
     DeserializationError,
     Event,
     Job,
+    JobAdded,
     JobOutcome,
     JobResult,
     Schedule,
@@ -411,6 +412,368 @@ async def test_acquire_schedules_lock_timeout(
     )
     assert len(acquired3) == 1
     assert acquired3[0].id == "s1"
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_acquire_schedules_fencing_token(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    time_machine: TimeMachineFixture,
+) -> None:
+    """
+    Test that every acquisition mints a new, unique token on the schedule and that
+    releasing the schedule clears it.
+
+    """
+    time_machine.move_to(datetime(2020, 9, 14, tzinfo=timezone.utc))
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    # The first scheduler acquires the schedule and receives a token
+    acquired1 = await datastore.acquire_schedules(
+        "scheduler1", timedelta(seconds=30), 1
+    )
+    assert len(acquired1) == 1
+    token1 = acquired1[0].acquired_token
+    assert token1 is not None
+
+    # Re-acquisition by the same scheduler mints a new token as well
+    acquired1b = await datastore.acquire_schedules(
+        "scheduler1", timedelta(seconds=30), 1
+    )
+    assert len(acquired1b) == 1
+    token1b = acquired1b[0].acquired_token
+    assert token1b is not None
+    assert token1b != token1
+
+    # After the lease has expired, another scheduler acquires the schedule and
+    # receives yet another token
+    time_machine.shift(31)
+    acquired2 = await datastore.acquire_schedules(
+        "scheduler2", timedelta(seconds=30), 1
+    )
+    assert len(acquired2) == 1
+    token2 = acquired2[0].acquired_token
+    assert token2 is not None
+    assert token2 != token1
+    assert token2 != token1b
+
+    # Releasing the schedule clears the token
+    result = ScheduleResult(
+        schedule_id=schedules[0].id,
+        task_id=schedules[0].task_id,
+        trigger=acquired2[0].trigger,
+        last_fire_time=datetime(2020, 9, 14, tzinfo=timezone.utc),
+        next_fire_time=None,
+        acquired_token=token2,
+    )
+    await datastore.release_schedules("scheduler2", [result])
+    stored = await datastore.get_schedules({schedules[0].id})
+    assert len(stored) == 1
+    assert stored[0].acquired_by is None
+    assert stored[0].acquired_until is None
+    assert stored[0].acquired_token is None
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_release_schedule_stale_commit_ignored_while_held_by_other(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    time_machine: TimeMachineFixture,
+) -> None:
+    """
+    Test that a scheduler whose lease has expired cannot advance the trigger time or
+    create jobs for a schedule that another scheduler is currently processing.
+
+    """
+    time_machine.move_to(datetime(2020, 9, 14, tzinfo=timezone.utc))
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    events: list[Event] = []
+    subscription = datastore._event_broker.subscribe(
+        events.append, {JobAdded, ScheduleUpdated}
+    )
+    with subscription:
+        # The first scheduler acquires the schedule
+        acquired_a = await datastore.acquire_schedules(
+            "scheduler-a", timedelta(seconds=30), 1
+        )
+        token_a = acquired_a[0].acquired_token
+
+        # After its lease has expired, another scheduler takes over
+        time_machine.shift(31)
+        acquired_b = await datastore.acquire_schedules(
+            "scheduler-b", timedelta(seconds=30), 1
+        )
+        assert len(acquired_b) == 1
+        token_b = acquired_b[0].acquired_token
+        assert token_b != token_a
+
+        # The first scheduler then tries to commit its stale result (with a job)
+        stale_job = Job(
+            task_id="task1",
+            executor="async",
+            schedule_id=schedules[0].id,
+            scheduled_fire_time=schedules[0].next_fire_time,
+        )
+        stale_result = ScheduleResult(
+            schedule_id=schedules[0].id,
+            task_id=schedules[0].task_id,
+            trigger=acquired_a[0].trigger,
+            last_fire_time=schedules[0].next_fire_time,
+            next_fire_time=datetime(2020, 9, 13, 1, tzinfo=timezone.utc),
+            acquired_token=token_a,
+            jobs=[stale_job],
+        )
+        await datastore.release_schedules("scheduler-a", [stale_result])
+        await anyio.sleep(0.1)
+
+    # No jobs may have been created from the stale result
+    assert not await datastore.get_jobs()
+
+    # The schedule must still be held by the second scheduler, with its trigger
+    # times untouched
+    stored = await datastore.get_schedules({schedules[0].id})
+    assert len(stored) == 1
+    assert stored[0].acquired_by == "scheduler-b"
+    assert stored[0].acquired_token == token_b
+    assert stored[0].next_fire_time == schedules[0].next_fire_time
+    assert stored[0].last_fire_time is None
+
+    # The stale release must not have produced any events
+    assert not events
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_release_schedule_stale_commit_after_takeover(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    time_machine: TimeMachineFixture,
+) -> None:
+    """
+    Test that when another scheduler has already processed a schedule after the
+    original scheduler's lease expired, the original scheduler's belated release
+
+    * does not create duplicate jobs, and
+    * does not roll back the next fire time written by the other scheduler.
+
+    """
+    time_machine.move_to(datetime(2020, 9, 14, tzinfo=timezone.utc))
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    events: list[Event] = []
+    subscription = datastore._event_broker.subscribe(
+        events.append, {JobAdded, ScheduleUpdated}
+    )
+    with subscription:
+        # The first scheduler acquires the schedule
+        acquired_a = await datastore.acquire_schedules(
+            "scheduler-a", timedelta(seconds=30), 1
+        )
+        token_a = acquired_a[0].acquired_token
+
+        # After its lease has expired, another scheduler takes over
+        time_machine.shift(31)
+        acquired_b = await datastore.acquire_schedules(
+            "scheduler-b", timedelta(seconds=30), 1
+        )
+        assert len(acquired_b) == 1
+        token_b = acquired_b[0].acquired_token
+        assert token_b != token_a
+
+        job_a = Job(
+            task_id="task1",
+            executor="async",
+            schedule_id=schedules[0].id,
+            scheduled_fire_time=schedules[0].next_fire_time,
+        )
+        job_b = Job(
+            task_id="task1",
+            executor="async",
+            schedule_id=schedules[0].id,
+            scheduled_fire_time=schedules[0].next_fire_time,
+        )
+        fire_time = schedules[0].next_fire_time
+        next_fire_time_a = datetime(2020, 9, 13, 1, tzinfo=timezone.utc)
+        next_fire_time_b = datetime(2020, 9, 20, tzinfo=timezone.utc)
+
+        # The second scheduler commits its result first (job + advanced fire time)
+        result_b = ScheduleResult(
+            schedule_id=schedules[0].id,
+            task_id=schedules[0].task_id,
+            trigger=acquired_b[0].trigger,
+            last_fire_time=fire_time,
+            next_fire_time=next_fire_time_b,
+            acquired_token=token_b,
+            jobs=[job_b],
+        )
+        await datastore.release_schedules("scheduler-b", [result_b])
+
+        # The first scheduler then commits its stale result. This must have no
+        # effect whatsoever.
+        result_a = ScheduleResult(
+            schedule_id=schedules[0].id,
+            task_id=schedules[0].task_id,
+            trigger=acquired_a[0].trigger,
+            last_fire_time=fire_time,
+            next_fire_time=next_fire_time_a,
+            acquired_token=token_a,
+            jobs=[job_a],
+        )
+        await datastore.release_schedules("scheduler-a", [result_a])
+        await anyio.sleep(0.1)
+
+    # Only the second scheduler's job may exist in the store
+    jobs = await datastore.get_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].id == job_b.id
+
+    # The schedule must retain the second scheduler's state
+    stored = await datastore.get_schedules({schedules[0].id})
+    assert len(stored) == 1
+    assert stored[0].acquired_by is None
+    assert stored[0].acquired_token is None
+    assert stored[0].last_fire_time == fire_time
+    assert stored[0].next_fire_time == next_fire_time_b
+
+    # Only the second scheduler's commit should have generated events
+    job_added_events = [event for event in events if isinstance(event, JobAdded)]
+    updated_events = [event for event in events if isinstance(event, ScheduleUpdated)]
+    assert [event.job_id for event in job_added_events] == [job_b.id]
+    assert len(updated_events) == 1
+    assert updated_events[0].schedule_id == schedules[0].id
+    assert updated_events[0].next_fire_time == next_fire_time_b
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython",
+    reason="time-machine is not available",
+)
+async def test_release_schedule_stale_commit_after_cleanup(
+    datastore: DataStore,
+    schedules: list[Schedule],
+    time_machine: TimeMachineFixture,
+) -> None:
+    """
+    Test that after clean-up has released a schedule with an expired lease, a stale
+    commit from the scheduler that originally held it neither creates jobs nor
+    changes the schedule.
+
+    """
+    time_machine.move_to(datetime(2020, 9, 14, tzinfo=timezone.utc))
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    await datastore.add_schedule(schedules[0], ConflictPolicy.exception)
+
+    acquired = await datastore.acquire_schedules(
+        "scheduler-a", timedelta(seconds=30), 1
+    )
+    token = acquired[0].acquired_token
+
+    # After the lease expires, clean-up releases the schedule
+    time_machine.shift(31)
+    async with capture_events(datastore, 1, {ScheduleUpdated}) as cleanup_events:
+        await datastore.cleanup()
+
+    assert len(cleanup_events) == 1
+
+    # A stale commit from the original scheduler must be a no-op
+    stale_job = Job(
+        task_id="task1",
+        executor="async",
+        schedule_id=schedules[0].id,
+        scheduled_fire_time=schedules[0].next_fire_time,
+    )
+    stale_result = ScheduleResult(
+        schedule_id=schedules[0].id,
+        task_id=schedules[0].task_id,
+        trigger=acquired[0].trigger,
+        last_fire_time=schedules[0].next_fire_time,
+        next_fire_time=datetime(2020, 9, 13, 1, tzinfo=timezone.utc),
+        acquired_token=token,
+        jobs=[stale_job],
+    )
+    events: list[Event] = []
+    subscription = datastore._event_broker.subscribe(
+        events.append, {JobAdded, ScheduleUpdated}
+    )
+    with subscription:
+        await datastore.release_schedules("scheduler-a", [stale_result])
+        await anyio.sleep(0.1)
+
+    assert not await datastore.get_jobs()
+    stored = await datastore.get_schedules({schedules[0].id})
+    assert len(stored) == 1
+    assert stored[0].acquired_by is None
+    assert stored[0].acquired_token is None
+    assert stored[0].next_fire_time == schedules[0].next_fire_time
+    assert stored[0].last_fire_time is None
+    assert not events
+
+
+async def test_release_schedules_stores_generated_jobs(datastore: DataStore) -> None:
+    """
+    Test that jobs passed in a schedule result are stored when the schedule is
+    released, with appropriate events.
+
+    """
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=timezone.utc))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    acquired = await datastore.acquire_schedules("foo", timedelta(seconds=30), 1)
+    assert len(acquired) == 1
+    job = Job(
+        task_id="task1",
+        executor="async",
+        schedule_id="s1",
+        scheduled_fire_time=schedule.next_fire_time,
+    )
+    result = ScheduleResult(
+        schedule_id="s1",
+        task_id="task1",
+        trigger=trigger,
+        last_fire_time=schedule.next_fire_time,
+        next_fire_time=None,
+        acquired_token=acquired[0].acquired_token,
+        jobs=[job],
+    )
+
+    events: list[Event] = []
+    subscription = datastore._event_broker.subscribe(
+        events.append, {JobAdded, ScheduleUpdated}
+    )
+    with subscription:
+        await datastore.release_schedules("foo", [result])
+        await anyio.sleep(0.1)
+
+    stored_jobs = await datastore.get_jobs()
+    assert len(stored_jobs) == 1
+    assert stored_jobs[0].id == job.id
+
+    assert len(events) == 2
+    assert isinstance(events[0], JobAdded)
+    assert events[0].job_id == job.id
+    assert events[0].schedule_id == "s1"
+    assert isinstance(events[1], ScheduleUpdated)
+    assert events[1].schedule_id == "s1"
+    assert events[1].next_fire_time is None
 
 
 async def test_acquire_multiple_workers(datastore: DataStore) -> None:

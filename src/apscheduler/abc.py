@@ -263,6 +263,13 @@ class DataStore(metaclass=ABCMeta):
         * Its claim has expired (``acquired_until`` is less than the current datetime)
         * It is claimed by the given scheduler (``acquired_by`` equals ``scheduler_id``)
 
+        Every successful acquisition generates a new, unique ``acquired_token`` on the
+        claimed schedule. This token identifies the acquisition epoch and is later
+        required (via :class:`~apscheduler.ScheduleResult`) when releasing the
+        schedule, so that a scheduler that has lost its lease can no longer advance
+        the schedule's trigger time or add jobs for it after another scheduler has
+        acquired the same schedule.
+
         :param scheduler_id: unique identifier of the scheduler
         :param lease_duration: the duration of the lease, after which the schedules can be
             acquired by another scheduler even if ``acquired_by`` is not ``None``
@@ -277,6 +284,16 @@ class DataStore(metaclass=ABCMeta):
         """
         Release the claims on the given schedules and update them on the store.
 
+        For each result, the data store advances the trigger time and stores the jobs
+        in the ``jobs`` field of the result only if the scheduler still owns the
+        schedule: ``acquired_by`` must equal ``scheduler_id`` and, when
+        ``acquired_token`` is set on the result, it must match the token stored with
+        the schedule. A result that fails this check is silently ignored. This makes
+        the release safe to call from a scheduler whose lease has expired in the
+        meantime: such a scheduler will neither overwrite a newer schedule state nor
+        create duplicate jobs for fire times that another scheduler has already
+        processed.
+
         The data store is responsible for updating the following fields on stored
         schedules:
 
@@ -285,6 +302,12 @@ class DataStore(metaclass=ABCMeta):
         * ``trigger``
         * ``acquired_by`` (must beset to ``None``)
         * ``acquired_until`` (must be set to ``None``)
+        * ``acquired_token`` (must be set to ``None``)
+
+        A :class:`~apscheduler.JobAdded` event must be published for every job that
+        was actually stored, followed by a
+        :class:`~apscheduler.ScheduleUpdated` event for every schedule that was
+        successfully updated.
 
         :param scheduler_id: unique identifier of the scheduler
         :param results: list of schedule processing results

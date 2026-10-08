@@ -972,6 +972,14 @@ class AsyncScheduler:
                     now = datetime.now(timezone.utc)
                     results: list[ScheduleResult] = []
                     for schedule in schedules:
+                        # Jobs generated from this schedule are collected here and
+                        # stored together with the release of the schedule. The data
+                        # store uses the acquisition token as a fencing token to only
+                        # commit this result if the scheduler still owns the schedule,
+                        # so a scheduler that has lost its lease can never cause
+                        # duplicate jobs to be created.
+                        jobs: list[Job] = []
+
                         # Calculate a next fire time for the schedule, if possible
                         fire_times = [schedule.next_fire_time]
                         calculate_next = schedule.trigger.next
@@ -1049,7 +1057,7 @@ class AsyncScheduler:
                                 result_expiration_time=schedule.job_result_expiration_time,
                                 metadata=schedule.metadata.copy(),
                             )
-                            await self.data_store.add_job(job)
+                            jobs.append(job)
 
                         results.append(
                             ScheduleResult(
@@ -1058,10 +1066,17 @@ class AsyncScheduler:
                                 trigger=schedule.trigger,
                                 last_fire_time=fire_times[-1],
                                 next_fire_time=next_fire_time,
+                                acquired_token=schedule.acquired_token,
+                                jobs=jobs,
                             )
                         )
 
-                # Update the schedules (and release the scheduler's claim on them)
+                # Advance the trigger times (and release the scheduler's claim on the
+                # schedules) and store the generated jobs in one fenced operation.
+                # Results for schedules this scheduler no longer holds (e.g. because
+                # the lease expired and another scheduler took over) are ignored by
+                # the data store, so neither duplicate jobs nor stale trigger times
+                # are written.
                 await self.data_store.release_schedules(self.identity, results)
 
                 # If we received fewer schedules than the maximum amount, sleep

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from logging import Logger
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anyio
 import attrs
@@ -361,6 +361,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             *next_fire_time_tzoffset_columns,
             Column("acquired_by", Unicode(500), index=True),
             Column("acquired_until", timestamp_type),
+            Column("acquired_token", Uuid),
         )
         Table(
             "jobs",
@@ -454,7 +455,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     else:
                         self._supports_update_returning = True
 
-    async def _deserialize_schedules(self, result: Result) -> list[Schedule]:
+    async def _deserialize_schedules(self, result: Iterable[Any]) -> list[Schedule]:
         schedules: list[Schedule] = []
         for row in result:
             try:
@@ -659,7 +660,9 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             now.timestamp() * 1000_000
                         )
 
-                    schedules_cte = (
+                    # Pick the candidate schedules, locking the rows against other
+                    # schedulers doing the same at the same time
+                    locked_select = (
                         select(self._t_schedules.c.id)
                         .where(
                             and_(
@@ -676,25 +679,50 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         .order_by(self._t_schedules.c.next_fire_time)
                         .limit(limit)
                         .with_for_update(skip_locked=True)
-                        .cte()
                     )
-                    subselect = select(schedules_cte.c.id)
+                    result = await self._execute(conn, locked_select)
+                    acquired_ids = [row[0] for row in result]
+                    if not acquired_ids:
+                        return []
+
+                    # Claim the schedules, assigning each one a unique fencing token
+                    # for this acquisition epoch
+                    p_id: BindParameter = bindparam("p_id")
+                    p_acquired_token: BindParameter = bindparam("p_acquired_token")
+                    update_args = [
+                        {"p_id": schedule_id, "p_acquired_token": uuid4()}
+                        for schedule_id in acquired_ids
+                    ]
                     update = (
                         self._t_schedules.update()
-                        .where(self._t_schedules.c.id.in_(subselect))
-                        .values(acquired_by=scheduler_id, acquired_until=acquired_until)
+                        .where(self._t_schedules.c.id == p_id)
+                        .values(
+                            acquired_by=scheduler_id,
+                            acquired_until=acquired_until,
+                            acquired_token=p_acquired_token,
+                        )
                     )
                     if self._supports_update_returning:
-                        update = update.returning(*self._t_schedules.columns)
-                        result = await self._execute(conn, update)
+                        # Execute the claims one at a time, because some dialects
+                        # (e.g. SQLite) do not support UPDATE ... RETURNING together
+                        # with executemany
+                        claimed_rows = []
+                        for params in update_args:
+                            claim_result = await self._execute(
+                                conn,
+                                update.returning(*self._t_schedules.columns),
+                                params,
+                            )
+                            claimed_rows.extend(claim_result.all())
+
+                        schedules = await self._deserialize_schedules(claimed_rows)
                     else:
-                        await self._execute(conn, update)
+                        await self._execute(conn, update, update_args)
                         query = self._t_schedules.select().where(
-                            and_(self._t_schedules.c.acquired_by == scheduler_id)
+                            self._t_schedules.c.id.in_(acquired_ids)
                         )
                         result = await self._execute(conn, query)
-
-                    schedules = await self._deserialize_schedules(result)
+                        schedules = await self._deserialize_schedules(result)
 
         return schedules
 
@@ -702,15 +730,16 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         self, scheduler_id: str, results: Sequence[ScheduleResult]
     ) -> None:
         task_ids = {result.schedule_id: result.task_id for result in results}
-        next_fire_times = {
-            result.schedule_id: result.next_fire_time for result in results
-        }
+        added_jobs: list[Job] = []
+        update_events: list[ScheduleUpdated] = []
+        finished_schedule_ids: list[str] = []
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
-                    update_events: list[ScheduleUpdated] = []
-                    finished_schedule_ids: list[str] = []
-                    update_args: list[dict[str, Any]] = []
+                    added_jobs = []
+                    update_events = []
+                    finished_schedule_ids = []
+                    matched_results: list[ScheduleResult] = []
                     for result in results:
                         try:
                             serialized_trigger = self.serializer.serialize(
@@ -722,82 +751,101 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 "removing from data store",
                                 result.schedule_id,
                             )
-                            finished_schedule_ids.append(result.schedule_id)
+                            # Only remove the schedule if it is still held by this
+                            # scheduler under the same acquisition (fencing) token
+                            conditions = [
+                                self._t_schedules.c.id == result.schedule_id,
+                                self._t_schedules.c.acquired_by == scheduler_id,
+                            ]
+                            if result.acquired_token is not None:
+                                conditions.append(
+                                    self._t_schedules.c.acquired_token
+                                    == result.acquired_token
+                                )
+
+                            delete = self._t_schedules.delete().where(and_(*conditions))
+                            delete_result = await self._execute(conn, delete)
+                            if delete_result.rowcount:
+                                finished_schedule_ids.append(result.schedule_id)
+
                             continue
 
-                        if self._supports_tzaware_timestamps:
-                            update_args.append(
-                                {
-                                    "p_id": result.schedule_id,
-                                    "p_trigger": serialized_trigger,
-                                    "p_last_fire_time": result.last_fire_time,
-                                    "p_next_fire_time": result.next_fire_time,
-                                }
-                            )
-                        else:
-                            update_args.append(
-                                {
-                                    "p_id": result.schedule_id,
-                                    "p_trigger": serialized_trigger,
-                                    **marshal_timestamp(
-                                        result.last_fire_time, "p_last_fire_time"
-                                    ),
-                                    **marshal_timestamp(
-                                        result.next_fire_time, "p_next_fire_time"
-                                    ),
-                                }
+                        # Advance the trigger time and release the schedule, but only
+                        # if this scheduler still holds the lease under the same
+                        # acquisition (fencing) token. This prevents a scheduler that
+                        # has lost its lease from overwriting schedule state or
+                        # creating duplicate jobs after another scheduler has taken
+                        # over.
+                        conditions = [
+                            self._t_schedules.c.id == result.schedule_id,
+                            self._t_schedules.c.acquired_by == scheduler_id,
+                        ]
+                        if result.acquired_token is not None:
+                            conditions.append(
+                                self._t_schedules.c.acquired_token
+                                == result.acquired_token
                             )
 
-                    # Update schedules
-                    if update_args:
-                        extra_values: dict[str, BindParameter] = {}
-                        p_id: BindParameter = bindparam("p_id")
-                        p_trigger: BindParameter = bindparam("p_trigger")
-                        p_last_fire_time: BindParameter = bindparam("p_last_fire_time")
-                        p_next_fire_time: BindParameter = bindparam("p_next_fire_time")
-                        if not self._supports_tzaware_timestamps:
-                            extra_values["last_fire_time_utcoffset"] = bindparam(
-                                "p_last_fire_time_utcoffset"
+                        values: dict[str, Any] = {
+                            "trigger": serialized_trigger,
+                            "acquired_by": None,
+                            "acquired_until": None,
+                            "acquired_token": None,
+                        }
+                        if self._supports_tzaware_timestamps:
+                            values["last_fire_time"] = result.last_fire_time
+                            values["next_fire_time"] = result.next_fire_time
+                        else:
+                            values.update(
+                                marshal_timestamp(
+                                    result.last_fire_time, "last_fire_time"
+                                )
                             )
-                            extra_values["next_fire_time_utcoffset"] = bindparam(
-                                "p_next_fire_time_utcoffset"
+                            values.update(
+                                marshal_timestamp(
+                                    result.next_fire_time, "next_fire_time"
+                                )
                             )
 
                         update = (
                             self._t_schedules.update()
-                            .where(
-                                and_(
-                                    self._t_schedules.c.id == p_id,
-                                    self._t_schedules.c.acquired_by == scheduler_id,
+                            .where(and_(*conditions))
+                            .values(**values)
+                        )
+                        update_result = await self._execute(conn, update)
+                        if update_result.rowcount:
+                            matched_results.append(result)
+
+                    # Insert the jobs generated by the schedules whose claims were
+                    # still valid, in the same transaction as the trigger time
+                    # advancement
+                    if matched_results:
+                        insert = self._t_jobs.insert()
+                        insert_args = []
+                        for result in matched_results:
+                            update_events.append(
+                                ScheduleUpdated(
+                                    schedule_id=result.schedule_id,
+                                    task_id=result.task_id,
+                                    next_fire_time=result.next_fire_time,
                                 )
                             )
-                            .values(
-                                trigger=p_trigger,
-                                last_fire_time=p_last_fire_time,
-                                next_fire_time=p_next_fire_time,
-                                acquired_by=None,
-                                acquired_until=None,
-                                **extra_values,
-                            )
-                        )
-                        # TODO: actually check which rows were updated?
-                        await self._execute(conn, update, update_args)
-                        updated_ids = list(next_fire_times)
+                            for job in result.jobs:
+                                added_jobs.append(job)
+                                insert_args.append(job.marshal(self.serializer))
 
-                        for schedule_id in updated_ids:
-                            event = ScheduleUpdated(
-                                schedule_id=schedule_id,
-                                task_id=task_ids[schedule_id],
-                                next_fire_time=next_fire_times[schedule_id],
-                            )
-                            update_events.append(event)
+                        if insert_args:
+                            await self._execute(conn, insert, insert_args)
 
-                    # Remove schedules that failed to serialize
-                    if finished_schedule_ids:
-                        delete = self._t_schedules.delete().where(
-                            self._t_schedules.c.id.in_(finished_schedule_ids)
-                        )
-                        await self._execute(conn, delete)
+        # Publish events for the jobs that were actually stored
+        for job in added_jobs:
+            await self._event_broker.publish(
+                JobAdded(
+                    job_id=job.id,
+                    task_id=job.task_id,
+                    schedule_id=job.schedule_id,
+                )
+            )
 
         for event in update_events:
             await self._event_broker.publish(event)
@@ -1236,7 +1284,11 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         update = (
                             self._t_schedules.update()
                             .where(self._t_schedules.c.id.in_(expired_schedule_ids))
-                            .values(acquired_by=None, acquired_until=None)
+                            .values(
+                                acquired_by=None,
+                                acquired_until=None,
+                                acquired_token=None,
+                            )
                         )
                         await self._execute(conn, update)
 

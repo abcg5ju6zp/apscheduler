@@ -11,14 +11,14 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from logging import Logger
 from typing import Any, ClassVar, TypeVar, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 import pymongo
 from attrs.validators import instance_of
 from bson import CodecOptions, UuidRepresentation
 from bson.codec_options import TypeEncoder, TypeRegistry
-from pymongo import ASCENDING, DeleteOne, UpdateOne
+from pymongo import ASCENDING
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
@@ -371,47 +371,45 @@ class MongoDBDataStore(BaseExternalDataStore):
                     if not documents:
                         return schedules
 
-                    now = datetime.now(timezone.utc)
-                    acquired_until = now + lease_duration
-                    schedule_ids = [doc["_id"] for doc in documents]
-                    result = await self._schedules.update_many(
-                        {
-                            "_id": {"$in": schedule_ids},
-                            "$or": [
-                                {"acquired_until": {"$exists": False}},
-                                {"acquired_until": {"$lt": now.timestamp()}},
-                            ],
-                        },
-                        {
-                            "$set": {
-                                "acquired_by": scheduler_id,
-                                **marshal_timestamp(acquired_until, "acquired_until"),
-                            }
-                        },
-                        session=session,
-                    )
-
-                    # If the number of modified schedules was smaller than expected,
-                    # manually check which ones were successfully acquired
-                    if result.modified_count != len(schedule_ids):
-                        async with self._schedules.find(
-                            {
-                                "_id": {"$in": schedule_ids},
-                                "acquired_by": scheduler_id,
-                            },
-                            sort=[("created_at", ASCENDING)],
-                            projection=["_id"],
-                            session=session,
-                        ) as cursor:
-                            acquired_schedule_ids = {doc["_id"] async for doc in cursor}
-                            documents = [
-                                doc
-                                for doc in documents
-                                if doc["_id"] in acquired_schedule_ids
-                            ]
-
                     for doc in documents:
-                        # Deserialize the schedule
+                        # Try to claim this specific schedule, minting a fresh fencing
+                        # token for this acquisition epoch. The conditional update
+                        # ensures that only one scheduler can claim a schedule at a
+                        # time, even if another scheduler grabbed it after the find()
+                        # above.
+                        now = datetime.now(timezone.utc)
+                        acquired_until = now + lease_duration
+                        acquired_token = uuid4()
+                        claim_result = await self._schedules.update_one(
+                            {
+                                "_id": doc["_id"],
+                                "$or": [
+                                    {"acquired_by": scheduler_id},
+                                    {"acquired_until": {"$exists": False}},
+                                    {"acquired_until": {"$lt": now.timestamp()}},
+                                ],
+                            },
+                            {
+                                "$set": {
+                                    "acquired_by": scheduler_id,
+                                    "acquired_token": acquired_token,
+                                    **marshal_timestamp(
+                                        acquired_until, "acquired_until"
+                                    ),
+                                }
+                            },
+                            session=session,
+                        )
+                        if not claim_result.matched_count:
+                            # Lost the race to another scheduler
+                            continue
+
+                        # Deserialize the claimed schedule
+                        doc["acquired_by"] = scheduler_id
+                        doc["acquired_token"] = acquired_token
+                        doc.update(
+                            marshal_timestamp(acquired_until, "acquired_until")
+                        )
                         doc["id"] = doc.pop("_id")
                         unmarshal_timestamps(doc)
                         schedules.append(Schedule.unmarshal(self.serializer, doc))
@@ -421,53 +419,103 @@ class MongoDBDataStore(BaseExternalDataStore):
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
     ) -> None:
-        updated_schedules: list[tuple[str, datetime | None]] = []
-        finished_schedule_ids: list[str] = []
         task_ids = {result.schedule_id: result.task_id for result in results}
-
-        requests: list[UpdateOne | DeleteOne] = []
-        for result in results:
-            filters = {"_id": result.schedule_id, "acquired_by": scheduler_id}
-            try:
-                serialized_trigger = self.serializer.serialize(result.trigger)
-            except SerializationError:
-                self._logger.exception(
-                    "Error serializing schedule %r – removing from data store",
-                    result.schedule_id,
-                )
-                requests.append(DeleteOne(filters))
-                finished_schedule_ids.append(result.schedule_id)
-                continue
-
-            update = {
-                "$unset": {
-                    "acquired_by": True,
-                    "acquired_until": True,
-                    "acquired_until_utcoffset": True,
-                },
-                "$set": {
-                    "trigger": serialized_trigger,
-                    **marshal_timestamp(result.last_fire_time, "last_fire_time"),
-                    **marshal_timestamp(result.next_fire_time, "next_fire_time"),
-                },
-            }
-            requests.append(UpdateOne(filters, update))
-            updated_schedules.append((result.schedule_id, result.next_fire_time))
-
-        if requests:
+        added_jobs: list[Job] = []
+        update_events: list[ScheduleUpdated] = []
+        finished_schedule_ids: list[str] = []
+        if results:
             async for attempt in self._retry():
                 with attempt:
                     async with self._client.start_session() as session:
-                        await self._schedules.bulk_write(
-                            requests, ordered=False, session=session
-                        )
+                        added_jobs = []
+                        update_events = []
+                        finished_schedule_ids = []
+                        for result in results:
+                            filters: dict[str, Any] = {
+                                "_id": result.schedule_id,
+                                "acquired_by": scheduler_id,
+                            }
+                            # Only commit the result if this scheduler still holds
+                            # the lease under the same acquisition (fencing) token.
+                            # This prevents a scheduler that has lost its lease from
+                            # overwriting schedule state or creating duplicate jobs
+                            # after another scheduler has taken over.
+                            if result.acquired_token is not None:
+                                filters["acquired_token"] = result.acquired_token
 
-        for schedule_id, next_fire_time in updated_schedules:
-            event = ScheduleUpdated(
-                schedule_id=schedule_id,
-                task_id=task_ids[schedule_id],
-                next_fire_time=next_fire_time,
+                            try:
+                                serialized_trigger = self.serializer.serialize(
+                                    result.trigger
+                                )
+                            except SerializationError:
+                                self._logger.exception(
+                                    "Error serializing schedule %r – removing from "
+                                    "data store",
+                                    result.schedule_id,
+                                )
+                                delete_result = await self._schedules.delete_one(
+                                    filters, session=session
+                                )
+                                if delete_result.deleted_count:
+                                    finished_schedule_ids.append(result.schedule_id)
+
+                                continue
+
+                            update = {
+                                "$unset": {
+                                    "acquired_by": True,
+                                    "acquired_until": True,
+                                    "acquired_until_utcoffset": True,
+                                    "acquired_token": True,
+                                },
+                                "$set": {
+                                    "trigger": serialized_trigger,
+                                    **marshal_timestamp(
+                                        result.last_fire_time, "last_fire_time"
+                                    ),
+                                    **marshal_timestamp(
+                                        result.next_fire_time, "next_fire_time"
+                                    ),
+                                },
+                            }
+                            update_result = await self._schedules.update_one(
+                                filters, update, session=session
+                            )
+                            if update_result.matched_count:
+                                update_events.append(
+                                    ScheduleUpdated(
+                                        schedule_id=result.schedule_id,
+                                        task_id=result.task_id,
+                                        next_fire_time=result.next_fire_time,
+                                    )
+                                )
+                                added_jobs.extend(result.jobs)
+
+                        # Insert the jobs generated by the schedules whose claims
+                        # were still valid, in the same session as the trigger time
+                        # advancement
+                        if added_jobs:
+                            job_documents = []
+                            for job in added_jobs:
+                                document = job.marshal(self.serializer)
+                                marshal_document(document)
+                                job_documents.append(document)
+
+                            await self._jobs.insert_many(
+                                job_documents, session=session
+                            )
+
+        # Publish events for the jobs that were actually stored
+        for job in added_jobs:
+            await self._event_broker.publish(
+                JobAdded(
+                    job_id=job.id,
+                    task_id=job.task_id,
+                    schedule_id=job.schedule_id,
+                )
             )
+
+        for event in update_events:
             await self._event_broker.publish(event)
 
         for schedule_id in finished_schedule_ids:
@@ -921,6 +969,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                                     "acquired_by": True,
                                     "acquired_until": True,
                                     "acquired_until_utcoffset": True,
+                                    "acquired_token": True,
                                 }
                             },
                             session=session,

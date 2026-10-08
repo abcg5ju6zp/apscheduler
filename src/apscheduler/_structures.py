@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, TypeAlias
@@ -144,6 +145,14 @@ class Schedule:
         processing
     :var str | None acquired_until: the time after which other schedulers are free to
         acquire the schedule for processing even if it is still marked as acquired
+    :var ~uuid.UUID | None acquired_token: an opaque token that uniquely identifies the
+        current acquisition of the schedule. A new token is generated every time the
+        schedule is acquired. The token is used as a fencing token: the trigger time
+        advancement and release of the schedule are only accepted as long as the token
+        presented by the scheduler matches the one stored with the schedule. This
+        prevents a scheduler that has lost its lease (e.g. due to a network partition
+        or a process stall) from creating duplicate jobs or overwriting the schedule
+        state after another scheduler has taken over
     """
 
     id: str = attrs.field(validator=[instance_of(str), min_len(1)], on_setattr=frozen)
@@ -195,6 +204,7 @@ class Schedule:
     acquired_until: datetime | None = attrs.field(
         converter=as_aware_datetime, default=None
     )
+    acquired_token: UUID | None = attrs.field(default=None, repr=False)
 
     def marshal(self, serializer: Serializer) -> dict[str, Any]:
         marshalled = attrs.asdict(self, recurse=False, value_serializer=serialize)
@@ -204,6 +214,7 @@ class Schedule:
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
+            del marshalled["acquired_token"]
 
         return marshalled
 
@@ -249,6 +260,15 @@ class ScheduleResult:
     :ivar trigger: the schedule's trigger
     :ivar last_fire_time: the schedule's trigger
     :ivar next_fire_time: the next
+    :ivar acquired_token: the value of the schedule's ``acquired_token`` field at the
+        time the schedule was acquired. Used as a fencing token when the results are
+        released: the data store only advances the schedule's trigger time and stores
+        the generated jobs if this token still matches the token stored with the
+        schedule. ``None`` disables the token check (legacy behavior)
+    :ivar jobs: the jobs generated from the schedule during this processing round.
+        These are added to the data store together with the trigger time advancement
+        in a single, fenced operation, so they are never created more than once even
+        if another scheduler has taken over the schedule after the lease expired
     """
 
     schedule_id: str
@@ -256,6 +276,8 @@ class ScheduleResult:
     trigger: Trigger
     last_fire_time: datetime
     next_fire_time: datetime | None
+    acquired_token: UUID | None = None
+    jobs: Sequence[Job] = attrs.field(factory=tuple)
 
 
 @attrs.define(kw_only=True, order=False)

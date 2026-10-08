@@ -1164,6 +1164,126 @@ class TestAsyncScheduler:
             assert job_released_event.outcome is JobOutcome.abandoned
             assert not await scheduler.get_jobs()
 
+    async def test_schedule_takeover_after_lease_expiry(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that when a scheduler stops heart-beating its schedule leases and is
+        late to commit its results, another scheduler takes over the schedule and
+        the original scheduler's belated commit neither creates duplicate jobs nor
+        rolls back the next fire time.
+
+        """
+        broker = LocalEventBroker()
+        lease = timedelta(milliseconds=300)
+
+        async with AsyncExitStack() as exit_stack:
+            # The first scheduler acquires schedules but (1) never extends its
+            # leases (as if it had been partitioned from the data store) and (2)
+            # commits its processing results only after the lease has expired.
+            scheduler_a = await exit_stack.enter_async_context(
+                AsyncScheduler(
+                    identity="scheduler-a",
+                    data_store=raw_datastore,
+                    event_broker=broker,
+                    role=SchedulerRole.scheduler,
+                    lease_duration=lease,
+                    cleanup_interval=None,
+                )
+            )
+
+            async def noop_extend(
+                scheduler_id: Any, schedule_ids: Any, duration: Any
+            ) -> None:
+                pass
+
+            original_release = raw_datastore.release_schedules
+
+            async def delayed_release(scheduler_id: Any, results: Any) -> None:
+                if scheduler_id == scheduler_a.identity:
+                    # Simulate the scheduler stalling until well after the lease
+                    # has expired and another scheduler has taken over
+                    await sleep(0.9)
+
+                await original_release(scheduler_id, results)
+
+            exit_stack.enter_context(
+                patch.object(
+                    raw_datastore,
+                    "extend_acquired_schedule_leases",
+                    new=noop_extend,
+                )
+            )
+            exit_stack.enter_context(
+                patch.object(
+                    raw_datastore, "release_schedules", new=delayed_release
+                )
+            )
+
+            job_added_ids: list[Any] = []
+            takeover_event = anyio.Event()
+
+            def on_job_added(event: JobAdded) -> None:
+                if event.schedule_id == "foo":
+                    job_added_ids.append(event.job_id)
+                    takeover_event.set()
+
+            exit_stack.enter_context(broker.subscribe(on_job_added, {JobAdded}))
+
+            await scheduler_a.add_schedule(
+                dummy_async_job, IntervalTrigger(seconds=10), id="foo"
+            )
+
+            # Pre-acquire the schedule as the first scheduler, so it is guaranteed
+            # to be the one processing it once started (its first processing pass
+            # will re-claim the schedule held by its own identity)
+            pre_acquired = await raw_datastore.acquire_schedules(
+                scheduler_a.identity, lease, 100
+            )
+            assert len(pre_acquired) == 1
+            await scheduler_a.start_in_background()
+
+            # Start a second scheduler that periodically cleans up expired leases
+            scheduler_b = await exit_stack.enter_async_context(
+                AsyncScheduler(
+                    identity="scheduler-b",
+                    data_store=raw_datastore,
+                    event_broker=broker,
+                    role=SchedulerRole.scheduler,
+                    lease_duration=lease,
+                    cleanup_interval=timedelta(milliseconds=100),
+                )
+            )
+            await scheduler_b.start_in_background()
+
+            # Wait for the second scheduler to take over and generate a job
+            with fail_after(5):
+                await takeover_event.wait()
+
+            # Wait long enough for the first scheduler's belated, stale commit to
+            # land (it must be silently ignored)
+            await sleep(1.1)
+
+            jobs = await raw_datastore.get_jobs()
+            assert len(jobs) == 1
+            assert jobs[0].schedule_id == "foo"
+
+            schedules = await raw_datastore.get_schedules({"foo"})
+            assert len(schedules) == 1
+            schedule = schedules[0]
+            assert schedule.acquired_by is None
+            assert schedule.acquired_until is None
+            assert schedule.acquired_token is None
+            assert schedule.last_fire_time is not None
+            # The next fire time must have been advanced by the second scheduler and
+            # not rolled back by the stale commit of the first one
+            assert schedule.next_fire_time is not None
+            assert schedule.next_fire_time > schedule.last_fire_time
+
+            # Exactly one job may have been generated for the schedule
+            assert len(job_added_ids) == 1
+            assert job_added_ids[0] == jobs[0].id
+
     async def test_stop_scheduler_while_job_running(
         self, raw_datastore: DataStore
     ) -> None:

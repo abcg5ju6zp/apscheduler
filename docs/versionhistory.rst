@@ -23,6 +23,13 @@ APScheduler, see the :doc:`migration section <migration>`.
   them; clean-up now releases schedules whose leases have expired and wakes up the
   other schedulers so they can acquire them
   (`#1053 <https://github.com/agronholm/apscheduler/issues/1053>`_)
+- Fixed a scheduler that had lost its schedule lease (due to a process stall, network
+  partition or being suspended) rolling back the next fire time and creating
+  duplicate jobs when it came back after another scheduler had taken over. Schedule
+  acquisition, lease extension, trigger time advancement and release now use a
+  fencing token (``Schedule.acquired_token``); the jobs generated from a schedule are
+  stored together with its release, and results carrying a stale token are silently
+  ignored by the data store
 - Fixed the synchronous ``Scheduler`` not enabling automatic clean-up by default,
   unlike ``AsyncScheduler``
   (`#1135 <https://github.com/agronholm/apscheduler/pull/1135>`_; PR by @dylanpulver)

@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import MAXYEAR, datetime, timedelta, timezone
 from functools import partial
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 
@@ -167,6 +167,8 @@ class MemoryDataStore(BaseDataStore):
             schedules.append(schedule)
             schedule.acquired_by = scheduler_id
             schedule.acquired_until = acquired_until
+            # Mint a new fencing token for this acquisition epoch
+            schedule.acquired_token = uuid4()
             if len(schedules) == limit:
                 break
 
@@ -175,10 +177,48 @@ class MemoryDataStore(BaseDataStore):
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
     ) -> None:
-        # Send update events for schedules
+        # Commit the results, but only for schedules that are still held by this
+        # scheduler under the same acquisition (fencing) token. This keeps a scheduler
+        # that has lost its lease from writing back stale trigger times or creating
+        # duplicate jobs after another scheduler has taken over the schedule.
+        events: list[JobAdded | ScheduleUpdated] = []
         for result in results:
+            schedule = self._schedules_by_id.get(result.schedule_id)
+            if schedule is None or schedule.acquired_by != scheduler_id:
+                continue
+
+            if (
+                result.acquired_token is not None
+                and schedule.acquired_token != result.acquired_token
+            ):
+                self._logger.debug(
+                    "Skipping release of schedule %r because the acquisition token "
+                    "presented by scheduler %r no longer matches the token stored in "
+                    "the data store",
+                    result.schedule_id,
+                    scheduler_id,
+                )
+                continue
+
+            # Add the jobs generated from this schedule, and advance the schedule's
+            # trigger time. All state mutations are done before any events are
+            # published (publishing may yield to other coroutines sharing the store),
+            # so the commit is effectively atomic within one event loop.
+            for job in result.jobs:
+                self._jobs_by_id[job.id] = job
+                self._jobs_by_task_id[job.task_id].add(job)
+                if job.schedule_id is not None:
+                    self._jobs_by_schedule_id[job.schedule_id].add(job)
+
+                events.append(
+                    JobAdded(
+                        job_id=job.id,
+                        task_id=job.task_id,
+                        schedule_id=job.schedule_id,
+                    )
+                )
+
             # Remove the schedule
-            schedule = self._schedules_by_id[result.schedule_id]
             index = self._find_schedule_index(schedule)
             del self._schedules[index]
 
@@ -187,12 +227,18 @@ class MemoryDataStore(BaseDataStore):
             schedule.next_fire_time = result.next_fire_time
             schedule.acquired_by = None
             schedule.acquired_until = None
+            schedule.acquired_token = None
             insort_right(self._schedules, schedule)
-            event = ScheduleUpdated(
-                schedule_id=result.schedule_id,
-                task_id=schedule.task_id,
-                next_fire_time=result.next_fire_time,
+            events.append(
+                ScheduleUpdated(
+                    schedule_id=result.schedule_id,
+                    task_id=schedule.task_id,
+                    next_fire_time=result.next_fire_time,
+                )
             )
+
+        # Publish the events only after all the state has been updated
+        for event in events:
             await self._event_broker.publish(event)
 
     async def get_next_schedule_run_time(self) -> datetime | None:
@@ -381,6 +427,7 @@ class MemoryDataStore(BaseDataStore):
             if schedule.acquired_until is not None and schedule.acquired_until < now:
                 schedule.acquired_by = None
                 schedule.acquired_until = None
+                schedule.acquired_token = None
                 event = ScheduleUpdated(
                     schedule_id=schedule.id,
                     task_id=schedule.task_id,

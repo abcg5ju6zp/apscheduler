@@ -182,6 +182,24 @@ class JobDeserializationFailed(DataStoreEvent):
 
 
 #
+# Event broker events
+#
+
+
+@attrs.define(kw_only=True, frozen=True)
+class EventBrokerReconnected(Event):
+    """
+    Signals that an event broker's subscription to an external broker has been
+    (re-)established.
+
+    Events may have been missed while the connection was down, so subscribers should
+    treat this as a resynchronization boundary and re-query any state they are
+    interested in. This event is only delivered to local subscribers; it is never
+    serialized or published to an external broker.
+    """
+
+
+#
 # Scheduler events
 #
 

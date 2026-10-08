@@ -86,6 +86,7 @@ Events
 .. autoclass:: apscheduler.JobRemoved
 .. autoclass:: apscheduler.ScheduleDeserializationFailed
 .. autoclass:: apscheduler.JobDeserializationFailed
+.. autoclass:: apscheduler.EventBrokerReconnected
 .. autoclass:: apscheduler.SchedulerEvent
 .. autoclass:: apscheduler.SchedulerStarted
 .. autoclass:: apscheduler.SchedulerStopped

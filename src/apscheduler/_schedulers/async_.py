@@ -34,6 +34,7 @@ from .._decorators import TaskParameters, get_task_params
 from .._enums import CoalescePolicy, ConflictPolicy, JobOutcome, RunState, SchedulerRole
 from .._events import (
     Event,
+    EventBrokerReconnected,
     JobReleased,
     ScheduleAdded,
     SchedulerStarted,
@@ -946,10 +947,29 @@ class AsyncScheduler:
                     self.identity, schedule_ids, self.lease_duration
                 )
 
-        subscription = self.event_broker.subscribe(
-            schedule_added_or_modified, {ScheduleAdded, ScheduleUpdated}
-        )
-        with subscription:
+        async with AsyncExitStack() as subscription_stack:
+            subscription_stack.enter_context(
+                self.event_broker.subscribe(
+                    schedule_added_or_modified, {ScheduleAdded, ScheduleUpdated}
+                )
+            )
+
+            # Wake up and re-query the data store for due schedules whenever the
+            # event broker subscription is re-established, as schedule changes may
+            # have been missed while the connection was down
+            def schedules_changed_off_broker(event: Event) -> None:
+                self.logger.debug(
+                    "Event broker reconnected – waking up the scheduler to "
+                    "resynchronize schedules"
+                )
+                wakeup_event.set()
+
+            subscription_stack.enter_context(
+                self.event_broker.subscribe(
+                    schedules_changed_off_broker, {EventBrokerReconnected}
+                )
+            )
+
             # Signal that we are ready, and wait for the scheduler start event
             task_status.started()
             await self.get_next_event(SchedulerStarted)
@@ -1140,10 +1160,14 @@ class AsyncScheduler:
                 name=f"Scheduler {self.identity!r} job lease extension loop",
             )
 
-            # Fetch new jobs every time
+            # Fetch new jobs every time a new job is added or a job finishes. A
+            # reconnection boundary wakes the loop as well, so that jobs added while
+            # the event broker connection was down get re-queried from the data
+            # store.
             exit_stack.enter_context(
                 self.event_broker.subscribe(
-                    check_queue_capacity, {JobAdded, JobReleased}
+                    check_queue_capacity,
+                    {JobAdded, JobReleased, EventBrokerReconnected},
                 )
             )
 

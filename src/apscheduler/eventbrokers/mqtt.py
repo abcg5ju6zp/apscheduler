@@ -8,8 +8,9 @@ from ssl import SSLContext
 from typing import Any
 
 import attrs
-from anyio import to_thread
+from anyio import create_memory_object_stream, move_on_after, sleep, to_thread
 from anyio.from_thread import BlockingPortal
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from attr.validators import in_, instance_of, optional
 from paho.mqtt.client import Client, MQTTMessage
 from paho.mqtt.enums import CallbackAPIVersion
@@ -19,6 +20,10 @@ from .._utils import create_repr
 from .base import BaseExternalEventBroker
 
 ALLOWED_TRANSPORTS = ("mqtt", "mqtts", "ws", "wss", "unix")
+
+#: Maximum number of published events to retain locally while the MQTT broker is
+#: unreachable, in the order they were published in.
+OUTBOX_MAX_SIZE = 100
 
 
 @attrs.define(eq=False, repr=False)
@@ -35,8 +40,8 @@ class MQTTEventBroker(BaseExternalEventBroker):
     :param transport: one of ``tcp``, ``websocket`` or ``unix`` (default: ``tcp``)
     :param client_id: MQTT client ID (needed to resume an MQTT session if a connection
         is broken)
-    :param ssl: either ``True`` or a custom SSL context to enable SSL/TLS, ``False`` to
-        disable
+    :param ssl: either ``True`` or a custom SSL context to enable SSL/TLS, ``False``
+        to disable
     :param topic: topic on which to send the messages
     :param subscribe_qos: MQTT QoS to use for subscribing messages
     :param publish_qos: MQTT QoS to use for publishing messages
@@ -63,6 +68,8 @@ class MQTTEventBroker(BaseExternalEventBroker):
     _client: Client = attrs.field(init=False)
     _portal: BlockingPortal = attrs.field(init=False)
     _ready_future: Future[None] = attrs.field(init=False)
+    _stopped: bool = attrs.field(init=False, default=True)
+    _outbox_send: MemoryObjectSendStream[bytes] = attrs.field(init=False)
 
     def __attrs_post_init__(self) -> None:
         if self.port is None:
@@ -97,10 +104,24 @@ class MQTTEventBroker(BaseExternalEventBroker):
         self._client.loop_start()
         exit_stack.push_async_callback(to_thread.run_sync, self._client.loop_stop)
 
+        # Outbox for notifications that could not be published because the MQTT
+        # broker was unreachable. Closing the send stream ends the publisher task
+        # during shutdown.
+        outbox_send, outbox_receive = create_memory_object_stream[bytes](
+            OUTBOX_MAX_SIZE
+        )
+        self._outbox_send = outbox_send
+        await exit_stack.enter_async_context(outbox_send)
+        self._task_group.start_soon(
+            self._publish_messages, outbox_receive, name="MQTT publisher"
+        )
+
         # Wait for the connection attempt to be done
         await to_thread.run_sync(self._ready_future.result, 10)
 
         # Schedule a disconnection for when the exit stack is exited
+        self._stopped = False
+        exit_stack.callback(setattr, self, "_stopped", True)
         exit_stack.callback(self._client.disconnect)
 
     def _on_connect(self, client: Client, *_: Any) -> None:
@@ -122,16 +143,79 @@ class MQTTEventBroker(BaseExternalEventBroker):
         )
 
     def _on_subscribe(self, *_: Any) -> None:
-        self._logger.info("%s: Subscribed", self.__class__.__name__)
-        self._ready_future.set_result(None)
+        if not self._ready_future.done():
+            self._logger.info("%s: Subscribed", self.__class__.__name__)
+            self._ready_future.set_result(None)
+        elif not self._stopped:
+            # The client automatically resubscribes after a reconnect. Do not
+            # signal until the broker has actually confirmed the subscription, so
+            # that no event published in this window is assumed to be received.
+            self._logger.info(
+                "%s: Subscription re-established after reconnect",
+                self.__class__.__name__,
+            )
+            try:
+                self._portal.call(self.signal_reconnected)
+            except Exception:
+                if not self._stopped:
+                    self._logger.exception(
+                        "%s: error signaling the reconnection boundary",
+                        self.__class__.__name__,
+                    )
 
     def _on_message(self, _: Any, __: Any, msg: MQTTMessage) -> None:
-        event = self.reconstitute_event(msg.payload)
+        origin, seq, event = self.decode_notification(msg.payload)
         if event is not None:
-            self._portal.call(self.publish_local, event)
+            self._portal.call(self.dispatch_remote_event, origin, seq, event)
+
+    async def _publish_messages(
+        self, receive: MemoryObjectReceiveStream[bytes]
+    ) -> None:
+        with receive:
+            async for notification in receive:
+                while not self._stopped:
+                    try:
+                        message_info = await to_thread.run_sync(
+                            self._client.publish,
+                            self.topic,
+                            notification,
+                            self.publish_qos,
+                        )
+                        if message_info.rc != 0:
+                            # The message was not even queued (e.g. there is no
+                            # connection to the broker)
+                            raise OSError(
+                                f"MQTT publish was not accepted (rc={message_info.rc})"
+                            )
+
+                        if self.publish_qos > 0:
+                            # Wait for the broker acknowledgement so that
+                            # unacknowledged messages can be retained and replayed
+                            # in order after a reconnect
+                            await to_thread.run_sync(
+                                message_info.wait_for_publish, 10
+                            )
+
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        # paho reports transport and acknowledgement failures using
+                        # a variety of exception types; treat any failure as
+                        # transient and replay the message in order after recovery
+                        if self._stopped:
+                            return
+
+                        self._logger.warning(
+                            "%s: failed to publish an event (%s); retaining it in "
+                            "the outbox for ordered replay after recovery",
+                            self.__class__.__name__,
+                            exc,
+                        )
+                        with move_on_after(1):
+                            await sleep(1)
 
     async def publish(self, event: Event) -> None:
+        # Deliver to local subscribers first, deterministically, so that they do not
+        # depend on the health of the external connection
+        await self.publish_local(event)
         notification = self.generate_notification(event)
-        await to_thread.run_sync(
-            lambda: self._client.publish(self.topic, notification, qos=self.publish_qos)
-        )
+        await self._outbox_send.send(notification)

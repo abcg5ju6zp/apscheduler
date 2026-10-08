@@ -8,6 +8,25 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
+- External event brokers now deliver published events to local subscribers
+  immediately at publish time, instead of relying on the round trip through the
+  external broker, so local subscribers are no longer affected by broker outages
+- External event brokers now tag every notification with an origin ID and a
+  monotonically increasing sequence number, enabling them to suppress their own
+  looped-back notifications and redelivered duplicates, detect gaps in the event
+  sequence, and emit a new :class:`~apscheduler.EventBrokerReconnected` event when
+  the subscription to the external broker is re-established after a disconnect.
+  Schedulers react to this boundary by re-querying the data store for due schedules
+  and jobs, and notifications sent by older broker versions (without the envelope)
+  are still accepted
+- Events that could not be published to an external broker because of a connection
+  failure are now retained in a bounded, ordered outbox and replayed in their
+  original order once the connection is recovered
+- Local event delivery now uses a bounded per-subscription backlog, so that a slow
+  subscriber cannot cause the broker to buffer events without bound; events
+  overflowing the backlog are dropped with a warning instead. Unsubscribing or
+  shutting down the broker also now deterministically releases the per-subscription
+  delivery task and its buffers
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+
 - Dropped support for Python 3.9
 - Fixed an issue where ``CronTrigger`` does not convert ``start_time`` to ``self.timezone``

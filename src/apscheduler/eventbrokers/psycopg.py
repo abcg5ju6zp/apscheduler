@@ -6,15 +6,11 @@ from logging import Logger
 from typing import TYPE_CHECKING, Any
 
 import attrs
-from anyio import (
-    EndOfStream,
-    create_memory_object_stream,
-    move_on_after,
-)
+from anyio import EndOfStream, create_memory_object_stream, move_on_after
 from anyio.abc import TaskStatus
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from attr.validators import instance_of
-from psycopg import AsyncConnection, InterfaceError
+from psycopg import AsyncConnection, InterfaceError, OperationalError
 
 from .._events import Event
 from .._exceptions import SerializationError
@@ -24,6 +20,10 @@ from .base import BaseExternalEventBroker
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+#: Maximum number of published events to retain locally while the PostgreSQL server
+#: is unreachable, in the order they were published in.
+OUTBOX_MAX_SIZE = 100
 
 
 def convert_options(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -68,7 +68,7 @@ class PsycopgEventBroker(BaseExternalEventBroker):
         **kwargs: Any,
     ) -> PsycopgEventBroker:
         """
-        Create a new psycopg event broker from a SQLAlchemy engine.
+        Create a new psycopg event broker from an SQLAlchemy engine.
 
         The engine will only be used to create the appropriate options for
         :meth:`psycopg.AsyncConnection.connect`.
@@ -97,7 +97,7 @@ class PsycopgEventBroker(BaseExternalEventBroker):
 
     @property
     def _temporary_failure_exceptions(self) -> tuple[type[Exception], ...]:
-        return OSError, InterfaceError
+        return OSError, InterfaceError, OperationalError
 
     @asynccontextmanager
     async def _connect(self) -> AsyncGenerator[AsyncConnection, None]:
@@ -112,7 +112,7 @@ class PsycopgEventBroker(BaseExternalEventBroker):
 
     async def start(self, exit_stack: AsyncExitStack, logger: Logger) -> None:
         await super().start(exit_stack, logger)
-        self._send, receive = create_memory_object_stream[str](100)
+        self._send, receive = create_memory_object_stream[str](OUTBOX_MAX_SIZE)
         try:
             await exit_stack.enter_async_context(self._send)
             await self._task_group.start(self._listen_notifications)
@@ -132,42 +132,59 @@ class PsycopgEventBroker(BaseExternalEventBroker):
                     if not task_started_sent:
                         task_status.started()
                         task_started_sent = True
+                    else:
+                        await self.signal_reconnected()
 
                     self._logger.debug("Listen connection established")
                     async for notify in conn.notifies():
-                        if event := self.reconstitute_event_str(notify.payload):
-                            await self.publish_local(event)
-                except InterfaceError as exc:
+                        origin, seq, event = self.decode_notification_str(
+                            notify.payload
+                        )
+                        if event is not None:
+                            await self.dispatch_remote_event(origin, seq, event)
+                except (InterfaceError, OperationalError) as exc:
                     self._logger.error("Connection error: %s", exc)
 
     async def _publish_notifications(
         self, receive: MemoryObjectReceiveStream[str], *, task_status: TaskStatus[None]
     ) -> None:
         task_started_sent = False
+        # The notification currently in flight (None when nothing is pending). It is
+        # kept here until the server has accepted it, so that it can be replayed in
+        # order after a connection failure instead of being lost.
+        notification: str | None = None
         with receive:
             while True:
                 async with self._connect() as conn:
-                    if not task_started_sent:
-                        task_status.started()
-                        task_started_sent = True
+                    try:
+                        if not task_started_sent:
+                            task_status.started()
+                            task_started_sent = True
 
-                    self._logger.debug("Publish connection established")
-                    notification: str | None = None
-                    while True:
-                        with move_on_after(self.max_idle_time):
-                            try:
-                                notification = await receive.receive()
-                            except EndOfStream:
-                                return
+                        self._logger.debug("Publish connection established")
+                        while True:
+                            if notification is None:
+                                with move_on_after(self.max_idle_time):
+                                    try:
+                                        notification = await receive.receive()
+                                    except EndOfStream:
+                                        return
 
-                        if notification:
-                            await conn.execute(
-                                "SELECT pg_notify(%t, %t)", [self.channel, notification]
-                            )
-                        else:
-                            await conn.execute("SELECT 1")
+                            if notification:
+                                await conn.execute(
+                                    "SELECT pg_notify(%t, %t)",
+                                    [self.channel, notification],
+                                )
+                                notification = None
+                            else:
+                                await conn.execute("SELECT 1")
+                    except (InterfaceError, OperationalError) as exc:
+                        self._logger.error("Connection error: %s", exc)
 
     async def publish(self, event: Event) -> None:
+        # Deliver to local subscribers first, deterministically, so that they do not
+        # depend on the health of the external connection
+        await self.publish_local(event)
         notification = self.generate_notification_str(event)
         if len(notification) > 7999:
             raise SerializationError(

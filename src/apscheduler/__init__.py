@@ -13,6 +13,7 @@ from ._enums import RunState as RunState
 from ._enums import SchedulerRole as SchedulerRole
 from ._events import DataStoreEvent as DataStoreEvent
 from ._events import Event as Event
+from ._events import EventBrokerReconnected as EventBrokerReconnected
 from ._events import JobAcquired as JobAcquired
 from ._events import JobAdded as JobAdded
 from ._events import JobDeserializationFailed as JobDeserializationFailed

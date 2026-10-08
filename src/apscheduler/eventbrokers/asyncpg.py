@@ -7,14 +7,11 @@ from typing import TYPE_CHECKING, Any
 
 import asyncpg
 import attrs
-from anyio import (
-    EndOfStream,
-    create_memory_object_stream,
-    move_on_after,
-)
+from anyio import EndOfStream, create_memory_object_stream, move_on_after
 from anyio.abc import TaskStatus
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from asyncpg import Connection, InterfaceError
+from asyncpg.exceptions import PostgresConnectionError
 from attr.validators import instance_of
 
 from .._events import Event
@@ -24,6 +21,10 @@ from .base import BaseExternalEventBroker
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+#: Maximum number of published events to retain locally while the PostgreSQL server
+#: is unreachable, in the order they were published in.
+OUTBOX_MAX_SIZE = 100
 
 
 @attrs.define(eq=False, repr=False)
@@ -86,7 +87,7 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
 
     @property
     def _temporary_failure_exceptions(self) -> tuple[type[Exception], ...]:
-        return OSError, InterfaceError
+        return OSError, InterfaceError, PostgresConnectionError
 
     @asynccontextmanager
     async def _connect(self) -> AsyncGenerator[asyncpg.Connection, None]:
@@ -101,7 +102,7 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
 
     async def start(self, exit_stack: AsyncExitStack, logger: Logger) -> None:
         await super().start(exit_stack, logger)
-        self._send, receive = create_memory_object_stream[str](100)
+        self._send, receive = create_memory_object_stream[str](OUTBOX_MAX_SIZE)
         await exit_stack.enter_async_context(self._send)
         await self._task_group.start(self._listen_notifications, receive)
 
@@ -109,13 +110,19 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
         self, receive: MemoryObjectReceiveStream[str], *, task_status: TaskStatus[None]
     ) -> None:
         conn: Connection
+        # The notification currently in flight (None when nothing is pending). It is
+        # kept here until the server has accepted it, so that it can be replayed in
+        # order after a connection failure instead of being lost.
+        notification: str | None = None
 
         async def listen_callback(
             connection: Connection, pid: int, channel: str, payload: str
         ) -> None:
-            event = self.reconstitute_event_str(payload)
+            origin, seq, event = self.decode_notification_str(payload)
             if event is not None:
-                self._task_group.start_soon(self.publish_local, event)
+                self._task_group.start_soon(
+                    self.dispatch_remote_event, origin, seq, event
+                )
 
         async def unsubscribe() -> None:
             if not conn.is_closed():
@@ -134,15 +141,17 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
                         if not task_started_sent:
                             task_status.started()
                             task_started_sent = True
+                        else:
+                            await self.signal_reconnected()
 
                         while True:
-                            notification: str | None = None
-                            with move_on_after(self.max_idle_time):
-                                try:
-                                    notification = await receive.receive()
-                                except EndOfStream:
-                                    self._logger.info("Stream finished")
-                                    return
+                            if notification is None:
+                                with move_on_after(self.max_idle_time):
+                                    try:
+                                        notification = await receive.receive()
+                                    except EndOfStream:
+                                        self._logger.info("Stream finished")
+                                        return
 
                             if notification:
                                 await conn.execute(
@@ -150,12 +159,16 @@ class AsyncpgEventBroker(BaseExternalEventBroker):
                                     self.channel,
                                     notification,
                                 )
+                                notification = None
                             else:
                                 await conn.execute("SELECT 1")
-                    except InterfaceError as exc:
+                    except (InterfaceError, PostgresConnectionError) as exc:
                         self._logger.error("Connection error: %s", exc)
 
     async def publish(self, event: Event) -> None:
+        # Deliver to local subscribers first, deterministically, so that they do not
+        # depend on the health of the external connection
+        await self.publish_local(event)
         notification = self.generate_notification_str(event)
         if len(notification) > 7999:
             raise SerializationError(

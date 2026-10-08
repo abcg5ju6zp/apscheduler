@@ -93,6 +93,32 @@ def unmarshal_timestamps(document: dict[str, Any]) -> None:
             document[key[:-10]] = datetime.fromtimestamp(time_micro, tzinfo)
 
 
+def task_revision_key(task_id: str, revision: int) -> dict[str, Any]:
+    return {"task_id": task_id, "revision": revision}
+
+
+def task_revision_filter(task_id: str, revision: int) -> dict[str, Any]:
+    # Dotted field matching is used because exact embedded document matches do not
+    # work reliably with the custom type registry codec options
+    return {"_id.task_id": task_id, "_id.revision": revision}
+
+
+def task_to_revision_document(
+    task: Task, serializer: Any, *, current: bool = True, job_count: int = 0
+) -> dict[str, Any]:
+    document = task.marshal(serializer)
+    task_id = document.pop("id")
+    document["_id"] = task_revision_key(task_id, document["revision"])
+    # Keep the task ID as a regular field as well, for queries and indexes
+    document["task_id"] = task_id
+    # "current" marks the latest configuration generation of a live task;
+    # "job_count" is the number of queued or running jobs bound to this generation.
+    # These enable atomic, race-free pruning with single-collection filters.
+    document["current"] = current
+    document["job_count"] = job_count
+    return document
+
+
 @attrs.define(eq=False, repr=False)
 class MongoDBDataStore(BaseExternalDataStore):
     """
@@ -130,6 +156,7 @@ class MongoDBDataStore(BaseExternalDataStore):
     ]
     _job_attrs: ClassVar[list[str]] = [field.name for field in attrs.fields(Job)]
     _tasks: AsyncCollection = attrs.field(init=False)
+    _task_revisions: AsyncCollection = attrs.field(init=False)
     _schedules: AsyncCollection = attrs.field(init=False)
     _jobs: AsyncCollection = attrs.field(init=False)
     _jobs_results: AsyncCollection = attrs.field(init=False)
@@ -159,6 +186,7 @@ class MongoDBDataStore(BaseExternalDataStore):
         )
         database = self._client.get_database(self.database, codec_options=codec_options)
         self._tasks = database["tasks"]
+        self._task_revisions = database["task_revisions"]
         self._schedules = database["schedules"]
         self._jobs = database["jobs"]
         self._jobs_results = database["job_results"]
@@ -171,14 +199,20 @@ class MongoDBDataStore(BaseExternalDataStore):
         async with self._client.start_session() as session:
             if self.start_from_scratch:
                 await self._tasks.delete_many({}, session=session)
+                await self._task_revisions.delete_many({}, session=session)
                 await self._schedules.delete_many({}, session=session)
                 await self._jobs.delete_many({}, session=session)
                 await self._jobs_results.delete_many({}, session=session)
 
+            await self._task_revisions.create_index("task_id", session=session)
+            await self._task_revisions.create_index(
+                [("current", ASCENDING), ("job_count", ASCENDING)], session=session
+            )
             await self._schedules.create_index("task_id", session=session)
             await self._schedules.create_index("next_fire_time", session=session)
             await self._schedules.create_index("acquired_by", session=session)
             await self._jobs.create_index("task_id", session=session)
+            await self._jobs.create_index("task_revision", session=session)
             await self._jobs.create_index("schedule_id", session=session)
             await self._jobs.create_index("created_at", session=session)
             await self._jobs.create_index("acquired_by", session=session)
@@ -202,19 +236,105 @@ class MongoDBDataStore(BaseExternalDataStore):
             with attempt:
                 await self._initialize()
 
-    async def add_task(self, task: Task) -> None:
+    async def add_task(self, task: Task) -> Task:
         async for attempt in self._retry():
             with attempt:
-                previous = await self._tasks.find_one_and_update(
-                    {"_id": task.id},
-                    {"$set": task.marshal(self.serializer)},
-                    upsert=True,
-                )
+                previous = await self._tasks.find_one({"_id": task.id})
+                if previous is None:
+                    document = task.marshal(self.serializer)
+                    document["_id"] = document.pop("id")
+                    document["revision"] = 1
+                    document["running_jobs"] = 0
+                    await self._tasks.insert_one(document)
+                    await self._task_revisions.insert_one(
+                        task_to_revision_document(
+                            attrs.evolve(task, revision=1, running_jobs=0),
+                            self.serializer,
+                        )
+                    )
+                    created = True
+                else:
+                    created = False
+                    # Timedeltas are stored as seconds, so normalize before
+                    # comparing
+                    stored_misfire_grace_time = (
+                        task.misfire_grace_time.total_seconds()
+                        if task.misfire_grace_time is not None
+                        else None
+                    )
+                    config_changed = any(
+                        previous.get(key) != value
+                        for key, value in (
+                            ("func", task.func),
+                            ("job_executor", task.job_executor),
+                            ("max_running_jobs", task.max_running_jobs),
+                            ("misfire_grace_time", stored_misfire_grace_time),
+                            ("metadata", task.metadata),
+                        )
+                    )
+                    old_revision = previous.get("revision", 1)
+                    if config_changed:
+                        revision = old_revision + 1
+                        running_jobs = 0
 
-        if previous:
-            await self._event_broker.publish(TaskUpdated(task_id=task.id))
-        else:
+                        # Backfill a snapshot of the previous configuration if this
+                        # revision is missing (e.g. a task created by an older
+                        # APScheduler version), so queued jobs keep a valid snapshot
+                        backfill_filter = task_revision_filter(task.id, old_revision)
+                        if await self._task_revisions.find_one(
+                            backfill_filter,
+                            projection=["_id"],
+                        ) is None:
+                            await self._task_revisions.insert_one(
+                                {
+                                    "_id": task_revision_key(task.id, old_revision),
+                                    "task_id": task.id,
+                                    "revision": old_revision,
+                                    "func": previous.get("func"),
+                                    "job_executor": previous.get("job_executor"),
+                                    "max_running_jobs": previous.get(
+                                        "max_running_jobs"
+                                    ),
+                                    "misfire_grace_time": previous.get(
+                                        "misfire_grace_time"
+                                    ),
+                                    "metadata": previous.get("metadata", {}),
+                                    "running_jobs": previous.get("running_jobs", 0),
+                                    "current": False,
+                                    "job_count": 0,
+                                }
+                            )
+
+                        # The previous generation is no longer the current one
+                        await self._task_revisions.update_many(
+                            {"task_id": task.id, "current": True},
+                            {"$set": {"current": False}},
+                        )
+                    else:
+                        revision = old_revision
+                        running_jobs = previous.get("running_jobs", 0)
+
+                    document = task.marshal(self.serializer)
+                    document.pop("id")
+                    document["revision"] = revision
+                    document["running_jobs"] = running_jobs
+                    await self._tasks.replace_one(
+                        {"_id": task.id}, document, upsert=True
+                    )
+                    if config_changed:
+                        snapshot = attrs.evolve(
+                            task, revision=revision, running_jobs=0
+                        )
+                        await self._task_revisions.insert_one(
+                            task_to_revision_document(snapshot, self.serializer)
+                        )
+
+        if created:
             await self._event_broker.publish(TaskAdded(task_id=task.id))
+        else:
+            await self._event_broker.publish(TaskUpdated(task_id=task.id))
+
+        return await self.get_task(task.id)
 
     async def remove_task(self, task_id: str) -> None:
         async for attempt in self._retry():
@@ -222,19 +342,43 @@ class MongoDBDataStore(BaseExternalDataStore):
                 if not await self._tasks.find_one_and_delete({"_id": task_id}):
                     raise TaskLookupError(task_id)
 
+                # The current generation stops being current now
+                await self._task_revisions.update_many(
+                    {"task_id": task_id, "current": True},
+                    {"$set": {"current": False}},
+                )
+
+                # Remove generations that no longer have any bound jobs
+                await self._task_revisions.delete_many(
+                    {"task_id": task_id, "current": False, "job_count": 0}
+                )
+
         await self._event_broker.publish(TaskRemoved(task_id=task_id))
 
-    async def get_task(self, task_id: str) -> Task:
+    async def get_task(self, task_id: str, revision: int | None = None) -> Task:
         async for attempt in self._retry():
             with attempt:
-                document = await self._tasks.find_one(
-                    {"_id": task_id}, projection=self._task_attrs
-                )
+                if revision is None:
+                    document = await self._tasks.find_one(
+                        {"_id": task_id}, projection=self._task_attrs
+                    )
+                else:
+                    document = await self._task_revisions.find_one(
+                        task_revision_filter(task_id, revision)
+                    )
+                    if document is not None:
+                        document.pop("_id")
+                        document.pop("current", None)
+                        document.pop("job_count", None)
 
         if not document:
             raise TaskLookupError(task_id)
 
-        document["id"] = document.pop("_id")
+        if revision is None:
+            document["id"] = document.pop("_id")
+        else:
+            document["id"] = document.pop("task_id")
+
         task = Task.unmarshal(self.serializer, document)
         return task
 
@@ -495,15 +639,64 @@ class MongoDBDataStore(BaseExternalDataStore):
             return None
 
     async def add_job(self, job: Job) -> None:
-        document = job.marshal(self.serializer)
-        marshal_document(document)
         async for attempt in self._retry():
             with attempt:
+                # Bind the job to the current task revision (if not already bound to
+                # a specific one)
+                if job.task_revision is None:
+                    task = await self._tasks.find_one(
+                        {"_id": job.task_id}, projection=["revision"]
+                    )
+                    if task is not None:
+                        job.task_revision = task["revision"]
+
+                document = job.marshal(self.serializer)
+                marshal_document(document)
                 await self._jobs.insert_one(document)
+
+                if job.task_revision is not None:
+                    # Count the job on its bound generation. If the snapshot is
+                    # missing (e.g. a task created by an older APScheduler version),
+                    # reconstruct it from the current task definition first.
+                    revision_filter = {
+                        "task_id": job.task_id,
+                        "revision": job.task_revision,
+                    }
+                    result = await self._task_revisions.update_one(
+                        revision_filter, {"$inc": {"job_count": 1}}
+                    )
+                    if not result.matched_count:
+                        task = await self._tasks.find_one({"_id": job.task_id})
+                        if task is not None:
+                            await self._task_revisions.update_one(
+                                task_revision_filter(
+                                    job.task_id, job.task_revision
+                                ),
+                                {
+                                    "$setOnInsert": {
+                                        "task_id": job.task_id,
+                                        "revision": job.task_revision,
+                                        "func": task.get("func"),
+                                        "job_executor": task.get("job_executor"),
+                                        "max_running_jobs": task.get(
+                                            "max_running_jobs"
+                                        ),
+                                        "misfire_grace_time": task.get(
+                                            "misfire_grace_time"
+                                        ),
+                                        "metadata": task.get("metadata", {}),
+                                        "running_jobs": 0,
+                                        "current": True,
+                                    },
+                                    "$inc": {"job_count": 1},
+                                },
+                                upsert=True,
+                            )
 
         event = JobAdded(
             job_id=job.id,
             task_id=job.task_id,
+            task_revision=job.task_revision,
             schedule_id=job.schedule_id,
         )
         await self._event_broker.publish(event)
@@ -603,6 +796,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                         # result
                         result = JobResult(
                             job_id=doc["id"],
+                            task_revision=doc.get("task_revision"),
                             outcome=JobOutcome.missed_start_deadline,
                             finished_at=now,
                             expires_at=now
@@ -617,6 +811,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 doc["task_id"],
                                 doc["schedule_id"],
                                 doc["scheduled_fire_time"],
+                                doc.get("task_revision"),
                                 decrement_running_job_count=False,
                             )
                         )
@@ -637,36 +832,77 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 job.task_id,
                                 job.schedule_id,
                                 job.scheduled_fire_time,
+                                job.task_revision,
                                 decrement_running_job_count=False,
                             )
                         )
                         continue
 
-                    # Try to increment the task's running jobs count
-                    update_task_result = await self._tasks.update_one(
-                        {
-                            "_id": job.task_id,
-                            "$or": [
-                                {"max_running_jobs": None},
+                    # Try to increment the running jobs count on the bound task
+                    # revision
+                    slot_filters: list[dict[str, Any]]
+                    if job.task_revision is None:
+                        # Legacy jobs without a bound revision use the current task
+                        # definition
+                        slot_filters = [
+                            {"_id": job.task_id},
+                            {
+                                "$or": [
+                                    {"max_running_jobs": None},
+                                    {
+                                        "$expr": {
+                                            "$gt": [
+                                                "$max_running_jobs",
+                                                "$running_jobs",
+                                            ]
+                                        }
+                                    },
+                                ]
+                            },
+                        ]
+                        update_task_result = await self._tasks.update_one(
+                            {"$and": slot_filters},
+                            {"$inc": {"running_jobs": 1}},
+                            session=session,
+                        )
+                    else:
+                        update_task_result = await self._task_revisions.update_one(
+                            {
+                                "task_id": job.task_id,
+                                "revision": job.task_revision,
+                                "$or": [
+                                    {"max_running_jobs": None},
+                                    {
+                                        "$expr": {
+                                            "$gt": [
+                                                "$max_running_jobs",
+                                                "$running_jobs",
+                                            ]
+                                        }
+                                    },
+                                ],
+                            },
+                            {"$inc": {"running_jobs": 1}},
+                            session=session,
+                        )
+                        if update_task_result.matched_count:
+                            # Mirror the increment on the current revision's task row
+                            await self._tasks.update_one(
                                 {
-                                    "$expr": {
-                                        "$gt": [
-                                            "$max_running_jobs",
-                                            "$running_jobs",
-                                        ]
-                                    }
+                                    "_id": job.task_id,
+                                    "revision": job.task_revision,
                                 },
-                            ],
-                        },
-                        {"$inc": {"running_jobs": 1}},
-                        session=session,
-                    )
+                                {"$inc": {"running_jobs": 1}},
+                                session=session,
+                            )
+
                     if not update_task_result.matched_count:
                         self._logger.debug(
-                            "Skipping job %s because task %r has the maximum number of "
-                            "jobs already running",
+                            "Skipping job %s because task %r revision %r has the "
+                            "maximum number of jobs already running",
                             job.id,
                             job.task_id,
+                            job.task_revision,
                         )
                         skipped_job_ids.append(job.id)
                         continue
@@ -706,6 +942,7 @@ class MongoDBDataStore(BaseExternalDataStore):
         task_id: str,
         schedule_id: str | None = None,
         scheduled_fire_time: datetime | None = None,
+        task_revision: int | None = None,
         *,
         decrement_running_job_count: bool = True,
     ) -> JobReleased:
@@ -721,15 +958,55 @@ class MongoDBDataStore(BaseExternalDataStore):
 
         # Decrement the running jobs counter if the job had been successfully acquired
         if decrement_running_job_count:
-            await self._tasks.find_one_and_update(
-                {"_id": task_id},
-                {"$inc": {"running_jobs": -1}},
+            if task_revision is not None:
+                await self._task_revisions.update_one(
+                    {"task_id": task_id, "revision": task_revision},
+                    {"$inc": {"running_jobs": -1}},
+                    session=session,
+                )
+                # Mirror the decrement on the current revision's task row
+                await self._tasks.update_one(
+                    {"_id": task_id, "revision": task_revision},
+                    {"$inc": {"running_jobs": -1}},
+                    session=session,
+                )
+            else:
+                await self._tasks.find_one_and_update(
+                    {"_id": task_id},
+                    {"$inc": {"running_jobs": -1}},
+                    session=session,
+                )
+
+        # Drop the job's reference on the bound task generation. If this was the last
+        # bound job and the generation is no longer current, remove it atomically.
+        if task_revision is not None:
+            deleted = await self._task_revisions.delete_one(
+                {
+                    **task_revision_filter(task_id, task_revision),
+                    "current": False,
+                    "job_count": 1,
+                },
                 session=session,
             )
+            if not deleted.deleted_count:
+                await self._task_revisions.update_one(
+                    {
+                        "task_id": task_id,
+                        "revision": task_revision,
+                        "job_count": {"$gt": 0},
+                    },
+                    {"$inc": {"job_count": -1}},
+                    session=session,
+                )
 
         # Notify other schedulers
         return JobReleased.from_result(
-            result, scheduler_id, task_id, schedule_id, scheduled_fire_time
+            result,
+            scheduler_id,
+            task_id,
+            schedule_id,
+            scheduled_fire_time,
+            task_revision,
         )
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
@@ -743,6 +1020,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                         job.task_id,
                         job.schedule_id,
                         job.scheduled_fire_time,
+                        job.task_revision,
                     )
 
                     # Notify other schedulers
@@ -821,6 +1099,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                             job.task_id,
                             job.schedule_id,
                             job.scheduled_fire_time,
+                            job.task_revision,
                         )
                         events.append(event)
 
@@ -864,6 +1143,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                             "_id",
                             "acquired_by",
                             "task_id",
+                            "task_revision",
                             "schedule_id",
                             "scheduled_fire_time",
                             "scheduled_fire_time_utcoffset",
@@ -874,6 +1154,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                             unmarshal_timestamps(doc)
                             result = JobResult(
                                 job_id=doc["_id"],
+                                task_revision=doc.get("task_revision"),
                                 outcome=JobOutcome.abandoned,
                                 finished_at=now,
                                 expires_at=now
@@ -887,6 +1168,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                                     doc["task_id"],
                                     doc["schedule_id"],
                                     doc["scheduled_fire_time"],
+                                    doc.get("task_revision"),
                                 )
                             )
 
@@ -940,6 +1222,13 @@ class MongoDBDataStore(BaseExternalDataStore):
                                     finished=True,
                                 )
                             )
+
+                    # Purge task configuration generations that are no longer current
+                    # and no longer referenced by any queued or running jobs
+                    await self._task_revisions.delete_many(
+                        {"current": False, "job_count": 0},
+                        session=session,
+                    )
 
         # Publish any events produced from the operations
         for event in events:

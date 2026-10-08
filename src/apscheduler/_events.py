@@ -133,11 +133,13 @@ class JobAdded(DataStoreEvent):
 
     :ivar job_id: ID of the job that was added
     :ivar task_id: ID of the task the job would run
+    :ivar task_revision: the task configuration generation the job was bound to
     :ivar schedule_id: ID of the schedule the job was created from
     """
 
     job_id: UUID = attrs.field(converter=as_uuid)
     task_id: str
+    task_revision: int | None = None
     schedule_id: str | None
 
 
@@ -215,6 +217,7 @@ class JobAcquired(SchedulerEvent):
     :param job_id: the ID of the job that was acquired
     :param scheduler_id: the ID of the scheduler that acquired the job
     :param task_id: ID of the task the job belongs to
+    :param task_revision: the task configuration generation the job was bound to
     :param schedule_id: ID of the schedule that
     :param scheduled_start: the time the job was scheduled to start via a schedule (if
         any)
@@ -223,6 +226,7 @@ class JobAcquired(SchedulerEvent):
     job_id: UUID = attrs.field(converter=as_uuid)
     scheduler_id: str
     task_id: str
+    task_revision: int | None = None
     schedule_id: str | None = None
     scheduled_start: datetime | None = attrs.field(converter=as_aware_datetime)
 
@@ -240,6 +244,7 @@ class JobAcquired(SchedulerEvent):
             job_id=job.id,
             scheduler_id=scheduler_id,
             task_id=job.task_id,
+            task_revision=job.task_revision,
             schedule_id=job.schedule_id,
             scheduled_start=job.scheduled_fire_time,
         )
@@ -253,6 +258,7 @@ class JobReleased(SchedulerEvent):
     :param uuid.UUID job_id: the ID of the job that was released
     :param scheduler_id: the ID of the scheduler that released the job
     :param task_id: ID of the task run by the job
+    :param task_revision: the task configuration generation the job was bound to
     :param schedule_id: ID of the schedule (if any) that created the job
     :param scheduled_start: the time the job was scheduled to start via the schedule (if
         any)
@@ -270,6 +276,7 @@ class JobReleased(SchedulerEvent):
     job_id: UUID = attrs.field(converter=as_uuid)
     scheduler_id: str
     task_id: str
+    task_revision: int | None = None
     schedule_id: str | None = None
     scheduled_start: datetime | None = attrs.field(converter=as_aware_datetime)
     started_at: datetime | None = attrs.field(converter=as_aware_datetime)
@@ -286,6 +293,7 @@ class JobReleased(SchedulerEvent):
         task_id: str,
         schedule_id: str | None,
         scheduled_fire_time: datetime | None = None,
+        task_revision: int | None = None,
     ) -> JobReleased:
         """
         Create a new job-released event from a job, the job result and a scheduler ID.
@@ -296,6 +304,7 @@ class JobReleased(SchedulerEvent):
         :param schedule_id: ID of the schedule (if any) from which the job was spawned
         :param scheduled_fire_time: the time the job was scheduled to start (if the job
             was spawned from a schedule)
+        :param task_revision: the task configuration generation the job was bound to
         :return: a new job-released event
 
         """
@@ -313,6 +322,9 @@ class JobReleased(SchedulerEvent):
             job_id=result.job_id,
             scheduler_id=scheduler_id,
             task_id=task_id,
+            task_revision=(
+                task_revision if task_revision is not None else result.task_revision
+            ),
             schedule_id=schedule_id,
             outcome=result.outcome,
             scheduled_start=scheduled_fire_time,

@@ -179,14 +179,20 @@ class DataStore(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    async def add_task(self, task: Task) -> None:
+    async def add_task(self, task: Task) -> Task:
         """
         Add the given task to the store.
 
-        If a task with the same ID already exists, it replaces the old one but does NOT
-        affect task accounting (# of running jobs).
+        If a task with the same ID already exists, its configuration is checked against
+        the existing one. If the configuration has changed, a new task configuration
+        generation (revision) is created. Jobs that are already queued or running
+        continue to use the old revision, while jobs created afterwards use the new one.
+        Replacing a task does not affect the accounting (# of running jobs) of any
+        existing revision.
 
         :param task: the task to be added
+        :return: the task as stored in the data store (including the assigned
+            configuration revision)
         """
 
     @abstractmethod
@@ -194,18 +200,25 @@ class DataStore(metaclass=ABCMeta):
         """
         Remove the task with the given ID.
 
+        Only the current task definition is removed. Configuration generations still
+        referenced by queued or running jobs are retained until the last referencing
+        job has completed or expired.
+
         :param task_id: ID of the task to be removed
         :raises TaskLookupError: if no matching task was found
         """
 
     @abstractmethod
-    async def get_task(self, task_id: str) -> Task:
+    async def get_task(self, task_id: str, revision: int | None = None) -> Task:
         """
         Get an existing task definition.
 
         :param task_id: ID of the task to be returned
+        :param revision: the specific configuration generation to return, or ``None`` to
+            return the current one. Queued jobs use this to retrieve the task
+            configuration they were created with.
         :return: the matching task
-        :raises TaskLookupError: if no matching task was found
+        :raises TaskLookupError: if no matching task (or task revision) was found
         """
 
     @abstractmethod
@@ -406,6 +419,8 @@ class DataStore(metaclass=ABCMeta):
           :class:`~apscheduler.ScheduleUpdated` event for each of them
         * Purge finished schedules (where ``next_run_time`` is ``None``) that have no
           running jobs associated with them
+        * Purge task configuration generations that are no longer current and are not
+          referenced by any queued or running jobs
         """
 
 

@@ -39,6 +39,7 @@ class MemoryDataStore(BaseDataStore):
     """
 
     _tasks: dict[str, Task] = attrs.Factory(dict)
+    _task_revisions: dict[tuple[str, int], Task] = attrs.Factory(dict)
     _schedules: list[Schedule] = attrs.Factory(list)
     _schedules_by_id: dict[str, Schedule] = attrs.Factory(dict)
     _schedules_by_task_id: dict[str, set[Schedule]] = attrs.Factory(
@@ -46,11 +47,47 @@ class MemoryDataStore(BaseDataStore):
     )
     _jobs_by_id: dict[UUID, Job] = attrs.Factory(dict)
     _jobs_by_task_id: dict[str, set[Job]] = attrs.Factory(partial(defaultdict, set))
+    _jobs_by_task_revision: dict[tuple[str, int | None], set[Job]] = attrs.Factory(
+        partial(defaultdict, set)
+    )
     _jobs_by_schedule_id: dict[str, set[Job]] = attrs.Factory(partial(defaultdict, set))
     _job_results: dict[UUID, JobResult] = attrs.Factory(dict)
 
     def __repr__(self) -> str:
         return create_repr(self)
+
+    @staticmethod
+    def _task_configs_equal(task: Task, other: Task) -> bool:
+        return (
+            task.func == other.func
+            and task.job_executor == other.job_executor
+            and task.max_running_jobs == other.max_running_jobs
+            and task.misfire_grace_time == other.misfire_grace_time
+            and task.metadata == other.metadata
+        )
+
+    def _get_job_task(self, job: Job) -> Task | None:
+        """Return the task configuration generation the job is bound to."""
+        if job.task_revision is not None:
+            return self._task_revisions.get((job.task_id, job.task_revision))
+
+        return self._tasks.get(job.task_id)
+
+    def _prune_task_revision(self, task_id: str, revision: int | None) -> None:
+        """Remove an old task configuration generation if nothing references it."""
+        if revision is None:
+            return
+
+        current = self._tasks.get(task_id)
+        if current is not None and current.revision == revision:
+            # This is the current revision of an existing task; always retain it
+            return
+
+        if self._jobs_by_task_revision.get((task_id, revision)):
+            # Jobs are still queued or running against this revision
+            return
+
+        self._task_revisions.pop((task_id, revision), None)
 
     def _find_schedule_index(self, schedule: Schedule) -> int:
         left_index = bisect_left(self._schedules, schedule)
@@ -67,28 +104,56 @@ class MemoryDataStore(BaseDataStore):
             if ids is None or schedule.id in ids
         ]
 
-    async def add_task(self, task: Task) -> None:
-        if task.id in self._tasks:
-            task.running_jobs = self._tasks[task.id].running_jobs
-            self._tasks[task.id] = task
-            await self._event_broker.publish(TaskUpdated(task_id=task.id))
-        else:
-            self._tasks[task.id] = task
+    async def add_task(self, task: Task) -> Task:
+        old = self._tasks.get(task.id)
+        if old is None:
+            stored = attrs.evolve(task, revision=1, running_jobs=0)
+            self._tasks[task.id] = stored
+            self._task_revisions[(task.id, 1)] = stored
             await self._event_broker.publish(TaskAdded(task_id=task.id))
+            return stored
+
+        # Only create a new configuration generation if the configuration actually
+        # changed; otherwise keep the current revision and its job accounting
+        if self._task_configs_equal(task, old):
+            stored = attrs.evolve(
+                task, revision=old.revision, running_jobs=old.running_jobs
+            )
+        else:
+            stored = attrs.evolve(task, revision=old.revision + 1, running_jobs=0)
+
+        self._tasks[task.id] = stored
+        self._task_revisions[(task.id, stored.revision)] = stored
+        await self._event_broker.publish(TaskUpdated(task_id=task.id))
+        return stored
 
     async def remove_task(self, task_id: str) -> None:
-        try:
-            del self._tasks[task_id]
-        except KeyError:
-            raise TaskLookupError(task_id) from None
+        if task_id not in self._tasks:
+            raise TaskLookupError(task_id)
+
+        del self._tasks[task_id]
+
+        # Any task configuration generations still referenced by queued or running
+        # jobs are deliberately retained (they are cleaned up once the last
+        # referencing job has finished)
+        revision_keys = [
+            key for key in self._task_revisions if key[0] == task_id
+        ]
+        for revision_task_id, revision_number in revision_keys:
+            self._prune_task_revision(revision_task_id, revision_number)
 
         await self._event_broker.publish(TaskRemoved(task_id=task_id))
 
-    async def get_task(self, task_id: str) -> Task:
-        try:
-            return self._tasks[task_id]
-        except KeyError:
-            raise TaskLookupError(task_id) from None
+    async def get_task(self, task_id: str, revision: int | None = None) -> Task:
+        if revision is None:
+            task = self._tasks.get(task_id)
+        else:
+            task = self._task_revisions.get((task_id, revision))
+
+        if task is None:
+            raise TaskLookupError(task_id)
+
+        return task
 
     async def get_tasks(self) -> list[Task]:
         return sorted(self._tasks.values())
@@ -199,14 +264,23 @@ class MemoryDataStore(BaseDataStore):
         return self._schedules[0].next_fire_time if self._schedules else None
 
     async def add_job(self, job: Job) -> None:
+        # Bind the job to the current task configuration generation (if not already
+        # bound to a specific one)
+        if job.task_revision is None:
+            task = self._tasks.get(job.task_id)
+            if task is not None:
+                job.task_revision = task.revision
+
         self._jobs_by_id[job.id] = job
         self._jobs_by_task_id[job.task_id].add(job)
+        self._jobs_by_task_revision[(job.task_id, job.task_revision)].add(job)
         if job.schedule_id is not None:
             self._jobs_by_schedule_id[job.schedule_id].add(job)
 
         event = JobAdded(
             job_id=job.id,
             task_id=job.task_id,
+            task_revision=job.task_revision,
             schedule_id=job.schedule_id,
         )
         await self._event_broker.publish(event)
@@ -230,7 +304,19 @@ class MemoryDataStore(BaseDataStore):
         jobs: list[Job] = []
         job_results: dict[Job, JobResult] = {}
         for job in self._jobs_by_id.values():
-            task = self._tasks[job.task_id]
+            task = self._get_job_task(job)
+
+            # If neither the bound task revision nor a current task definition
+            # exists, the job can never be run
+            if task is None:
+                job_results[job] = JobResult(
+                    job_id=job.id,
+                    task_revision=job.task_revision,
+                    outcome=JobOutcome.missed_start_deadline,
+                    finished_at=now,
+                    expires_at=now + job.result_expiration_time,
+                )
+                continue
 
             # Skip already acquired jobs (unless the acquisition lock has expired)
             if job.acquired_until is not None:
@@ -243,6 +329,7 @@ class MemoryDataStore(BaseDataStore):
             if job.start_deadline and job.start_deadline < now:
                 job_results[job] = JobResult(
                     job_id=job.id,
+                    task_revision=job.task_revision,
                     outcome=JobOutcome.missed_start_deadline,
                     finished_at=now,
                     expires_at=now + job.result_expiration_time,
@@ -292,9 +379,11 @@ class MemoryDataStore(BaseDataStore):
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result
 
-        # Decrement the number of running jobs for this task
+        # Decrement the number of running jobs on the bound task revision
         if job.acquired_by:
-            self._tasks[job.task_id].running_jobs -= 1
+            task = self._get_job_task(job)
+            if task is not None:
+                task.running_jobs -= 1
 
         # Delete the job
         job = self._jobs_by_id.pop(result.job_id)
@@ -305,6 +394,12 @@ class MemoryDataStore(BaseDataStore):
         if not task_jobs:
             del self._jobs_by_task_id[job.task_id]
 
+        # Remove the job from the jobs belonging to its task revision
+        revision_jobs = self._jobs_by_task_revision[(job.task_id, job.task_revision)]
+        revision_jobs.remove(job)
+        if not revision_jobs:
+            del self._jobs_by_task_revision[(job.task_id, job.task_revision)]
+
         # If this was a scheduled job, remove the job from the set of jobs belonging to
         # this schedule
         if job.schedule_id:
@@ -312,6 +407,9 @@ class MemoryDataStore(BaseDataStore):
             schedule_jobs.remove(job)
             if not schedule_jobs:
                 del self._jobs_by_schedule_id[job.schedule_id]
+
+        # Remove the bound task revision if it is no longer needed
+        self._prune_task_revision(job.task_id, job.task_revision)
 
         # Notify other schedulers
         await self._event_broker.publish(
@@ -321,6 +419,7 @@ class MemoryDataStore(BaseDataStore):
                 job.task_id,
                 job.schedule_id,
                 job.scheduled_fire_time,
+                job.task_revision,
             )
         )
 
@@ -396,3 +495,8 @@ class MemoryDataStore(BaseDataStore):
             and schedule_id not in self._jobs_by_schedule_id
         ]
         await self.remove_schedules(finished_schedule_ids, finished=True)
+
+        # Purge task configuration generations that are no longer current and are not
+        # referenced by any queued or running jobs
+        for task_id, revision in list(self._task_revisions):
+            self._prune_task_revision(task_id, revision)

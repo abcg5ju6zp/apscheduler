@@ -665,6 +665,154 @@ async def test_add_get_task(datastore: DataStore) -> None:
     assert task.func == "contextlib:asynccontextmanager"
 
 
+async def test_task_revisions(datastore: DataStore) -> None:
+    """Configuration changes create new revisions; identical reconfigures don't."""
+    task = await datastore.add_task(
+        Task(id="test_task", func="builtins:print", job_executor="async")
+    )
+    assert task.revision == 1
+    assert (await datastore.get_task("test_task", 1)).func == "builtins:print"
+
+    # Reconfiguring with identical settings does not create a new revision
+    task = await datastore.add_task(
+        Task(id="test_task", func="builtins:print", job_executor="async")
+    )
+    assert task.revision == 1
+
+    # Changing the configuration creates a new revision while retaining the old one
+    task = await datastore.add_task(
+        Task(id="test_task", func="builtins:repr", job_executor="async")
+    )
+    assert task.revision == 2
+    assert (await datastore.get_task("test_task")).revision == 2
+    assert (await datastore.get_task("test_task", 1)).func == "builtins:print"
+    assert (await datastore.get_task("test_task", 2)).func == "builtins:repr"
+
+    with pytest.raises(TaskLookupError):
+        await datastore.get_task("test_task", 99)
+
+
+async def test_jobs_bind_task_revision(datastore: DataStore) -> None:
+    """Jobs use the concurrency limit of the revision they were bound to."""
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="async",
+            max_running_jobs=1,
+        )
+    )
+    old_jobs = [Job(task_id="task1", executor="async") for _ in range(2)]
+    for job in old_jobs:
+        await datastore.add_job(job)
+        assert job.task_revision == 1
+
+    # Update the task with a higher concurrency limit
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="async",
+            max_running_jobs=3,
+        )
+    )
+    new_job = Job(task_id="task1", executor="async")
+    await datastore.add_job(new_job)
+    assert new_job.task_revision == 2
+
+    # One of the two old jobs and the new job can run; the second old job is blocked
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 10)
+    assert len(acquired) == 2
+    assert sum(job.task_revision == 1 for job in acquired) == 1
+    assert sum(job.task_revision == 2 for job in acquired) == 1
+    assert (await datastore.get_task("task1", 1)).running_jobs == 1
+    assert (await datastore.get_task("task1", 2)).running_jobs == 1
+    assert (await datastore.get_task("task1")).running_jobs == 1
+
+    # Releasing the old job frees a slot on revision 1, but does not affect revision 2
+    old_acquired = next(job for job in acquired if job.task_revision == 1)
+    await datastore.release_job(
+        "worker1",
+        old_acquired,
+        JobResult.from_job(old_acquired, JobOutcome.success),
+    )
+    assert (await datastore.get_task("task1", 1)).running_jobs == 0
+    assert (await datastore.get_task("task1", 2)).running_jobs == 1
+    assert (await datastore.get_task("task1")).running_jobs == 1
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 10)
+    assert len(acquired) == 1
+    assert acquired[0].id == old_jobs[1].id
+    assert acquired[0].task_revision == 1
+
+
+async def test_old_task_revision_pruned_after_last_job(datastore: DataStore) -> None:
+    """Old revisions are removed once no queued or running jobs reference them."""
+    await datastore.add_task(
+        Task(id="task1", func="builtins:print", job_executor="async")
+    )
+    job = Job(task_id="task1", executor="async")
+    await datastore.add_job(job)
+
+    await datastore.add_task(
+        Task(id="task1", func="builtins:repr", job_executor="async")
+    )
+    # The old revision is retained because the queued job references it
+    assert (await datastore.get_task("task1", 1)).func == "builtins:print"
+
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired) == 1
+    await datastore.release_job(
+        "worker1",
+        acquired[0],
+        JobResult.from_job(acquired[0], JobOutcome.success),
+    )
+
+    # The old revision is now gone; the current one remains
+    with pytest.raises(TaskLookupError):
+        await datastore.get_task("task1", 1)
+    assert (await datastore.get_task("task1", 2)).revision == 2
+
+    # cleanup() must not remove the current revision either
+    await datastore.cleanup()
+    assert (await datastore.get_task("task1")).revision == 2
+
+
+async def test_remove_task_retains_snapshot_for_queued_jobs(
+    datastore: DataStore,
+) -> None:
+    """Removing a task keeps the configuration snapshots of its queued jobs."""
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="async",
+            max_running_jobs=1,
+        )
+    )
+    job = Job(task_id="task1", executor="async")
+    await datastore.add_job(job)
+    assert job.task_revision == 1
+
+    await datastore.remove_task("task1")
+    with pytest.raises(TaskLookupError):
+        await datastore.get_task("task1")
+
+    # The queued job can still be acquired and released using the retained snapshot
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 1)
+    assert len(acquired) == 1
+    assert acquired[0].task_revision == 1
+    await datastore.release_job(
+        "worker1",
+        acquired[0],
+        JobResult.from_job(acquired[0], JobOutcome.success),
+    )
+
+    # With the last job gone, the retained snapshot is removed as well
+    with pytest.raises(TaskLookupError):
+        await datastore.get_task("task1", 1)
+    assert not await datastore.get_jobs()
+
+
 async def test_cancel_start(
     raw_datastore: DataStore, local_broker: EventBroker, logger: Logger
 ) -> None:

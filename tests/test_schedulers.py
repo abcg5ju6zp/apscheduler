@@ -85,6 +85,14 @@ async def dummy_async_job(delay: float = 0, fail: bool = False) -> str:
         return "returnvalue"
 
 
+async def revision_dummy_job_v1() -> str:
+    return "revision-one"
+
+
+async def revision_dummy_job_v2() -> str:
+    return "revision-two"
+
+
 def dummy_sync_job(delay: float = 0, fail: bool = False) -> str:
     time.sleep(delay)
     if fail:
@@ -762,6 +770,37 @@ class TestAsyncScheduler:
 
             with pytest.raises(JobLookupError), fail_after(1):
                 await scheduler.get_job_result(job_id, wait=False)
+
+    async def test_queued_job_uses_task_revision_at_queue_time(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """A queued job keeps using the task configuration of its own generation."""
+        async with AsyncScheduler(data_store=raw_datastore) as scheduler:
+            await scheduler.start_in_background()
+            await scheduler.configure_task(
+                "revision_dummy_job", func=revision_dummy_job_v1
+            )
+            old_job_id = await scheduler.add_job(
+                "revision_dummy_job", result_expiration_time=10
+            )
+
+            # Reconfigure the task with a different callable before the old job has
+            # necessarily run yet
+            await scheduler.configure_task(
+                "revision_dummy_job", func=revision_dummy_job_v2
+            )
+            new_job_id = await scheduler.add_job(
+                "revision_dummy_job", result_expiration_time=10
+            )
+
+            old_result = await scheduler.get_job_result(old_job_id)
+            new_result = await scheduler.get_job_result(new_job_id)
+            assert old_result.outcome is JobOutcome.success
+            assert new_result.outcome is JobOutcome.success
+            assert old_result.return_value == "revision-one"
+            assert new_result.return_value == "revision-two"
+            assert old_result.task_revision == 1
+            assert new_result.task_revision == 2
 
     async def test_add_job_not_rewriting_task_config(
         self, raw_datastore: DataStore

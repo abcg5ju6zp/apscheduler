@@ -33,7 +33,9 @@ from sqlalchemy import (
     and_,
     bindparam,
     create_engine,
+    exists,
     false,
+    func,
     or_,
     select,
 )
@@ -127,6 +129,7 @@ class _JobDiscard:
     job_id: UUID
     outcome: JobOutcome
     task_id: str
+    task_revision: int | None
     schedule_id: str | None
     scheduled_fire_time: datetime | None
     result_expires_at: datetime
@@ -177,6 +180,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
     _metadata: MetaData = attrs.field(init=False)
     _t_metadata: Table = attrs.field(init=False)
     _t_tasks: Table = attrs.field(init=False)
+    _t_task_revisions: Table = attrs.field(init=False)
     _t_schedules: Table = attrs.field(init=False)
     _t_jobs: Table = attrs.field(init=False)
     _t_job_results: Table = attrs.field(init=False)
@@ -202,6 +206,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         self._metadata = self.get_table_definitions()
         self._t_metadata = self._metadata.tables[prefix + "metadata"]
         self._t_tasks = self._metadata.tables[prefix + "tasks"]
+        self._t_task_revisions = self._metadata.tables[prefix + "task_revisions"]
         self._t_schedules = self._metadata.tables[prefix + "schedules"]
         self._t_jobs = self._metadata.tables[prefix + "jobs"]
         self._t_job_results = self._metadata.tables[prefix + "job_results"]
@@ -335,6 +340,19 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             "tasks",
             metadata,
             Column("id", Unicode(500), primary_key=True),
+            Column("revision", SmallInteger, nullable=False, server_default=literal(1)),
+            Column("func", Unicode(500)),
+            Column("job_executor", Unicode(500), nullable=False),
+            Column("max_running_jobs", Integer),
+            Column("misfire_grace_time", interval_type),
+            Column("metadata", json_type, nullable=False),
+            Column("running_jobs", Integer, nullable=False, server_default=literal(0)),
+        )
+        Table(
+            "task_revisions",
+            metadata,
+            Column("task_id", Unicode(500), primary_key=True),
+            Column("revision", SmallInteger, primary_key=True),
             Column("func", Unicode(500)),
             Column("job_executor", Unicode(500), nullable=False),
             Column("max_running_jobs", Integer),
@@ -367,6 +385,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             metadata,
             Column("id", Uuid, primary_key=True),
             Column("task_id", Unicode(500), nullable=False, index=True),
+            Column("task_revision", SmallInteger, index=True),
             Column("args", LargeBinary, nullable=False),
             Column("kwargs", LargeBinary, nullable=False),
             Column("schedule_id", Unicode(500), index=True),
@@ -384,6 +403,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             "job_results",
             metadata,
             Column("job_id", Uuid, primary_key=True),
+            Column("task_revision", SmallInteger),
             Column("outcome", Enum(JobOutcome, metadata=metadata), nullable=False),
             Column("started_at", timestamp_type, index=True),
             Column("finished_at", timestamp_type, nullable=False),
@@ -483,40 +503,129 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
 
         return jobs
 
-    async def add_task(self, task: Task) -> None:
+    def _task_revision_prune_statement(self) -> Any:
+        """
+        Return a DELETE statement that removes the task configuration generation bound
+        to the ``p_task_id`` / ``p_revision`` parameters if it is no longer the current
+        revision of its task and is not referenced by any queued or running job.
+        """
+        jobs_alias = self._t_jobs.alias()
+        tasks_alias = self._t_tasks.alias()
+        return self._t_task_revisions.delete().where(
+            self._t_task_revisions.c.task_id == bindparam("p_task_id"),
+            self._t_task_revisions.c.revision == bindparam("p_revision"),
+            ~exists().where(
+                and_(
+                    jobs_alias.c.task_id == self._t_task_revisions.c.task_id,
+                    jobs_alias.c.task_revision == self._t_task_revisions.c.revision,
+                )
+            ),
+            ~exists().where(
+                and_(
+                    tasks_alias.c.id == self._t_task_revisions.c.task_id,
+                    tasks_alias.c.revision == self._t_task_revisions.c.revision,
+                )
+            ),
+        )
+
+    async def add_task(self, task: Task) -> Task:
         insert = self._t_tasks.insert().values(
             id=task.id,
+            revision=1,
             func=task.func,
             job_executor=task.job_executor,
             max_running_jobs=task.max_running_jobs,
             misfire_grace_time=task.misfire_grace_time,
             metadata=task.metadata,
         )
+        insert_revision = self._t_task_revisions.insert().values(
+            task_id=task.id,
+            revision=1,
+            func=task.func,
+            job_executor=task.job_executor,
+            max_running_jobs=task.max_running_jobs,
+            misfire_grace_time=task.misfire_grace_time,
+            metadata=task.metadata,
+            running_jobs=0,
+        )
         try:
             async for attempt in self._retry():
                 with attempt:
                     async with self._begin_transaction() as conn:
                         await self._execute(conn, insert)
+                        await self._execute(conn, insert_revision)
         except IntegrityError:
-            update = (
-                self._t_tasks.update()
-                .values(
-                    func=task.func,
-                    job_executor=task.job_executor,
-                    max_running_jobs=task.max_running_jobs,
-                    misfire_grace_time=task.misfire_grace_time,
-                    metadata=task.metadata,
-                )
-                .where(self._t_tasks.c.id == task.id)
-            )
+            config_values = {
+                "func": task.func,
+                "job_executor": task.job_executor,
+                "max_running_jobs": task.max_running_jobs,
+                "misfire_grace_time": task.misfire_grace_time,
+                "metadata": task.metadata,
+            }
             async for attempt in self._retry():
                 with attempt:
                     async with self._begin_transaction() as conn:
+                        # Find out the current revision and configuration
+                        query = select(
+                            self._t_tasks.c.revision,
+                            self._t_tasks.c.func,
+                            self._t_tasks.c.job_executor,
+                            self._t_tasks.c.max_running_jobs,
+                            self._t_tasks.c.misfire_grace_time,
+                            self._t_tasks.c.metadata,
+                        ).where(self._t_tasks.c.id == task.id)
+                        row_mapping = (await self._execute(conn, query)).one()._mapping
+                        config_changed = any(
+                            row_mapping[column] != value
+                            for column, value in (
+                                (self._t_tasks.c.func, task.func),
+                                (self._t_tasks.c.job_executor, task.job_executor),
+                                (
+                                    self._t_tasks.c.max_running_jobs,
+                                    task.max_running_jobs,
+                                ),
+                                (
+                                    self._t_tasks.c.misfire_grace_time,
+                                    task.misfire_grace_time,
+                                ),
+                                (self._t_tasks.c.metadata, task.metadata),
+                            )
+                        )
+                        if config_changed:
+                            new_revision = row_mapping[self._t_tasks.c.revision] + 1
+                            config_values["revision"] = new_revision
+                            config_values["running_jobs"] = 0
+                            insert_new_revision = (
+                                self._t_task_revisions.insert().values(
+                                    task_id=task.id,
+                                    revision=new_revision,
+                                    running_jobs=0,
+                                    **{
+                                        key: config_values[key]
+                                        for key in (
+                                            "func",
+                                            "job_executor",
+                                            "max_running_jobs",
+                                            "misfire_grace_time",
+                                            "metadata",
+                                        )
+                                    },
+                                )
+                            )
+                            await self._execute(conn, insert_new_revision)
+
+                        update = (
+                            self._t_tasks.update()
+                            .where(self._t_tasks.c.id == task.id)
+                            .values(**config_values)
+                        )
                         await self._execute(conn, update)
 
             await self._event_broker.publish(TaskUpdated(task_id=task.id))
         else:
             await self._event_broker.publish(TaskAdded(task_id=task.id))
+
+        return await self.get_task(task.id)
 
     async def remove_task(self, task_id: str) -> None:
         delete = self._t_tasks.delete().where(self._t_tasks.c.id == task_id)
@@ -529,11 +638,33 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     else:
                         await self._event_broker.publish(TaskRemoved(task_id=task_id))
 
-    async def get_task(self, task_id: str) -> Task:
-        query = self._t_tasks.select().where(self._t_tasks.c.id == task_id)
+    async def get_task(self, task_id: str, revision: int | None = None) -> Task:
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
+                    if revision is None:
+                        query = self._t_tasks.select().where(
+                            self._t_tasks.c.id == task_id
+                        )
+                    else:
+                        # Return the configuration snapshot of the specific revision
+                        revision_table = self._t_task_revisions.c
+                        query = select(
+                            revision_table.task_id.label("id"),
+                            revision_table.revision,
+                            revision_table.func,
+                            revision_table.job_executor,
+                            revision_table.max_running_jobs,
+                            revision_table.misfire_grace_time,
+                            revision_table.metadata,
+                            revision_table.running_jobs,
+                        ).where(
+                            and_(
+                                revision_table.task_id == task_id,
+                                revision_table.revision == revision,
+                            )
+                        )
+
                     result = await self._execute(conn, query)
                     row = result.first()
 
@@ -841,16 +972,30 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         return result.scalar()
 
     async def add_job(self, job: Job) -> None:
-        marshalled = job.marshal(self.serializer)
-        insert = self._t_jobs.insert().values(**marshalled)
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
+                    marshalled = job.marshal(self.serializer)
+
+                    # Bind the job to the current task revision (if not already bound
+                    # to a specific one) in the same transaction to avoid mixing
+                    # generations with a concurrent task update
+                    if marshalled["task_revision"] is None:
+                        query = select(self._t_tasks.c.revision).where(
+                            self._t_tasks.c.id == job.task_id
+                        )
+                        revision = (await self._execute(conn, query)).scalar()
+                        if revision is not None:
+                            marshalled["task_revision"] = revision
+                            job.task_revision = revision
+
+                    insert = self._t_jobs.insert().values(**marshalled)
                     await self._execute(conn, insert)
 
         event = JobAdded(
             job_id=job.id,
             task_id=job.task_id,
+            task_revision=job.task_revision,
             schedule_id=job.schedule_id,
         )
         await self._event_broker.publish(event)
@@ -880,11 +1025,27 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     query = (
                         select(
                             self._t_jobs,
-                            self._t_tasks.c.max_running_jobs,
-                            self._t_tasks.c.running_jobs,
+                            func.coalesce(
+                                self._t_task_revisions.c.max_running_jobs,
+                                self._t_tasks.c.max_running_jobs,
+                            ).label("effective_max_running_jobs"),
+                            func.coalesce(
+                                self._t_task_revisions.c.running_jobs,
+                                self._t_tasks.c.running_jobs,
+                            ).label("effective_running_jobs"),
                         )
-                        .join(
-                            self._t_tasks, self._t_tasks.c.id == self._t_jobs.c.task_id
+                        .outerjoin(
+                            self._t_tasks,
+                            self._t_tasks.c.id == self._t_jobs.c.task_id,
+                        )
+                        .outerjoin(
+                            self._t_task_revisions,
+                            and_(
+                                self._t_task_revisions.c.task_id
+                                == self._t_jobs.c.task_id,
+                                self._t_task_revisions.c.revision
+                                == self._t_jobs.c.task_revision,
+                            ),
                         )
                         .where(
                             or_(
@@ -896,6 +1057,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         .with_for_update(
                             skip_locked=True,
                             of=[
+                                self._t_task_revisions.c.running_jobs,
                                 self._t_tasks.c.running_jobs,
                                 self._t_jobs.c.acquired_by,
                                 self._t_jobs.c.acquired_until,
@@ -910,19 +1072,23 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
 
                     acquired_jobs: list[Job] = []
                     discarded_jobs: list[_JobDiscard] = []
-                    task_job_slots_left: dict[str, float] = defaultdict(
-                        lambda: float("inf")
+                    task_job_slots_left: dict[tuple[str, int | None], float] = (
+                        defaultdict(lambda: float("inf"))
                     )
-                    running_job_count_increments: dict[str, int] = defaultdict(
-                        lambda: 0
+                    running_job_count_increments: dict[tuple[str, int | None], int] = (
+                        defaultdict(lambda: 0)
                     )
                     for row in result:
                         job_dict = row._asdict()
-                        task_max_running_jobs = job_dict.pop("max_running_jobs")
-                        task_running_jobs = job_dict.pop("running_jobs")
+                        task_max_running_jobs = job_dict.pop(
+                            "effective_max_running_jobs"
+                        )
+                        task_running_jobs = job_dict.pop("effective_running_jobs")
+                        slot_key = (row.task_id, row.task_revision)
                         if task_max_running_jobs is not None:
                             task_job_slots_left.setdefault(
-                                row.task_id, task_max_running_jobs - task_running_jobs
+                                slot_key,
+                                task_max_running_jobs - task_running_jobs,
                             )
 
                         # Deserialize the job
@@ -936,6 +1102,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                     job_id=row.id,
                                     outcome=JobOutcome.deserialization_failed,
                                     task_id=row.task_id,
+                                    task_revision=row.task_revision,
                                     schedule_id=row.schedule_id,
                                     scheduled_fire_time=row.scheduled_fire_time,
                                     result_expires_at=now + row.result_expiration_time,
@@ -951,6 +1118,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                     job_id=row.id,
                                     outcome=JobOutcome.missed_start_deadline,
                                     task_id=row.task_id,
+                                    task_revision=row.task_revision,
                                     schedule_id=row.schedule_id,
                                     scheduled_fire_time=row.scheduled_fire_time,
                                     result_expires_at=now + row.result_expiration_time,
@@ -959,18 +1127,19 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             continue
 
                         # Skip the job if no more slots are available
-                        if not task_job_slots_left[job.task_id]:
+                        if not task_job_slots_left[slot_key]:
                             self._logger.debug(
-                                "Skipping job %s because task %r has the maximum "
-                                "number of %d jobs already running",
+                                "Skipping job %s because task %r revision %r has the "
+                                "maximum number of %d jobs already running",
                                 job.id,
                                 job.task_id,
+                                job.task_revision,
                                 task_max_running_jobs,
                             )
                             continue
 
-                        task_job_slots_left[job.task_id] -= 1
-                        running_job_count_increments[job.task_id] += 1
+                        task_job_slots_left[slot_key] -= 1
+                        running_job_count_increments[slot_key] += 1
                         job.acquired_by = scheduler_id
                         job.acquired_until = acquired_until
                         acquired_jobs.append(job)
@@ -990,26 +1159,82 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         )
                         await self._execute(conn, update)
 
-                        # Increment the running job counters on each task
-                        p_id: BindParameter = bindparam("p_id")
-                        p_increment: BindParameter = bindparam("p_increment")
-                        params = [
-                            {"p_id": task_id, "p_increment": increment}
-                            for task_id, increment in running_job_count_increments.items()
+                        # Increment the running job counters on each bound task
+                        # revision, and mirror the increment on the tasks row of the
+                        # current revision (legacy jobs without a bound revision only
+                        # increment the tasks row)
+                        revision_params = [
+                            {
+                                "p_task_id": task_id,
+                                "p_revision": revision,
+                                "p_increment": increment,
+                            }
+                            for (
+                                task_id,
+                                revision,
+                            ), increment in running_job_count_increments.items()
+                            if revision is not None
                         ]
-                        update = (
-                            self._t_tasks.update()
-                            .values(
-                                running_jobs=self._t_tasks.c.running_jobs + p_increment
+                        legacy_params = [
+                            {"p_id": task_id, "p_increment": increment}
+                            for (task_id, revision), increment in (
+                                running_job_count_increments.items()
                             )
-                            .where(self._t_tasks.c.id == p_id)
-                        )
-                        await self._execute(conn, update, params)
+                            if revision is None
+                        ]
+                        if revision_params:
+                            p_task_id: BindParameter = bindparam("p_task_id")
+                            p_revision: BindParameter = bindparam("p_revision")
+                            p_increment: BindParameter = bindparam("p_increment")
+                            update = (
+                                self._t_task_revisions.update()
+                                .values(
+                                    running_jobs=(
+                                        self._t_task_revisions.c.running_jobs
+                                        + p_increment
+                                    )
+                                )
+                                .where(
+                                    self._t_task_revisions.c.task_id == p_task_id,
+                                    self._t_task_revisions.c.revision == p_revision,
+                                )
+                            )
+                            await self._execute(conn, update, revision_params)
+
+                            # Mirror the counters on the current revision's tasks row
+                            update = (
+                                self._t_tasks.update()
+                                .values(
+                                    running_jobs=self._t_tasks.c.running_jobs
+                                    + p_increment
+                                )
+                                .where(
+                                    self._t_tasks.c.id == p_task_id,
+                                    self._t_tasks.c.revision == p_revision,
+                                )
+                            )
+                            await self._execute(conn, update, revision_params)
+
+                        if legacy_params:
+                            p_legacy_id: BindParameter = bindparam("p_id")
+                            p_legacy_increment: BindParameter = bindparam(
+                                "p_increment"
+                            )
+                            update = (
+                                self._t_tasks.update()
+                                .values(
+                                    running_jobs=self._t_tasks.c.running_jobs
+                                    + p_legacy_increment
+                                )
+                                .where(self._t_tasks.c.id == p_legacy_id)
+                            )
+                            await self._execute(conn, update, legacy_params)
 
                     # Discard the jobs that could not start
                     for discard in discarded_jobs:
                         result = JobResult(
                             job_id=discard.job_id,
+                            task_revision=discard.task_revision,
                             outcome=discard.outcome,
                             finished_at=now,
                             expires_at=discard.result_expires_at,
@@ -1023,6 +1248,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 discard.task_id,
                                 discard.schedule_id,
                                 discard.scheduled_fire_time,
+                                discard.task_revision,
                                 decrement_running_job_count=False,
                             )
                         )
@@ -1041,6 +1267,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         task_id: str,
         schedule_id: str | None = None,
         scheduled_fire_time: datetime | None = None,
+        task_revision: int | None = None,
         *,
         decrement_running_job_count: bool = True,
     ) -> JobReleased:
@@ -1050,22 +1277,57 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             insert = self._t_job_results.insert().values(**marshalled)
             await self._execute(conn, insert)
 
-        # Decrement the number of running jobs for this task
+        # Decrement the number of running jobs on the bound task revision
         if decrement_running_job_count:
-            update = (
-                self._t_tasks.update()
-                .values(running_jobs=self._t_tasks.c.running_jobs - 1)
-                .where(self._t_tasks.c.id == task_id)
-            )
-            await self._execute(conn, update)
+            if task_revision is not None:
+                update = (
+                    self._t_task_revisions.update()
+                    .values(running_jobs=self._t_task_revisions.c.running_jobs - 1)
+                    .where(
+                        self._t_task_revisions.c.task_id == task_id,
+                        self._t_task_revisions.c.revision == task_revision,
+                    )
+                )
+                await self._execute(conn, update)
+
+                # Mirror the decrement on the current revision's tasks row
+                update = (
+                    self._t_tasks.update()
+                    .values(running_jobs=self._t_tasks.c.running_jobs - 1)
+                    .where(
+                        self._t_tasks.c.id == task_id,
+                        self._t_tasks.c.revision == task_revision,
+                    )
+                )
+                await self._execute(conn, update)
+            else:
+                update = (
+                    self._t_tasks.update()
+                    .values(running_jobs=self._t_tasks.c.running_jobs - 1)
+                    .where(self._t_tasks.c.id == task_id)
+                )
+                await self._execute(conn, update)
 
         # Delete the job
         delete = self._t_jobs.delete().where(self._t_jobs.c.id == result.job_id)
         await self._execute(conn, delete)
 
+        # Remove the bound task revision if it is no longer needed
+        if task_revision is not None:
+            await self._execute(
+                conn,
+                self._task_revision_prune_statement(),
+                {"p_task_id": task_id, "p_revision": task_revision},
+            )
+
         # Create the event, to be sent after commit
         return JobReleased.from_result(
-            result, scheduler_id, task_id, schedule_id, scheduled_fire_time
+            result,
+            scheduler_id,
+            task_id,
+            schedule_id,
+            scheduled_fire_time,
+            task_revision,
         )
 
     async def release_job(self, scheduler_id: str, job: Job, result: JobResult) -> None:
@@ -1079,6 +1341,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         job.task_id,
                         job.schedule_id,
                         job.scheduled_fire_time,
+                        job.task_revision,
                     )
 
         # Notify other schedulers
@@ -1159,6 +1422,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 job.task_id,
                                 job.schedule_id,
                                 job.scheduled_fire_time,
+                                job.task_revision,
                             )
                             events.append(event)
 
@@ -1181,6 +1445,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     query = select(
                         self._t_jobs.c.id,
                         self._t_jobs.c.task_id,
+                        self._t_jobs.c.task_revision,
                         self._t_jobs.c.schedule_id,
                         self._t_jobs.c.scheduled_fire_time,
                         self._t_jobs.c.acquired_by,
@@ -1192,6 +1457,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     for row in await self._execute(conn, query):
                         result = JobResult(
                             job_id=row.id,
+                            task_revision=row.task_revision,
                             outcome=JobOutcome.abandoned,
                             finished_at=now,
                             expires_at=now + row.result_expiration_time,
@@ -1204,6 +1470,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 row.task_id,
                                 row.schedule_id,
                                 row.scheduled_fire_time,
+                                row.task_revision,
                             )
                         )
 
@@ -1267,6 +1534,29 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 finished=True,
                             )
                         )
+
+                    # Purge task configuration generations that are no longer current
+                    # and are not referenced by any queued or running jobs
+                    jobs_alias = self._t_jobs.alias()
+                    tasks_alias = self._t_tasks.alias()
+                    prune = self._t_task_revisions.delete().where(
+                        ~exists().where(
+                            and_(
+                                jobs_alias.c.task_id
+                                == self._t_task_revisions.c.task_id,
+                                jobs_alias.c.task_revision
+                                == self._t_task_revisions.c.revision,
+                            )
+                        ),
+                        ~exists().where(
+                            and_(
+                                tasks_alias.c.id == self._t_task_revisions.c.task_id,
+                                tasks_alias.c.revision
+                                == self._t_task_revisions.c.revision,
+                            )
+                        ),
+                    )
+                    await self._execute(conn, prune)
 
                 # Publish any events produced from the operations
                 for event in events:

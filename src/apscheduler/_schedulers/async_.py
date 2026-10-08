@@ -451,7 +451,7 @@ class AsyncScheduler:
                 modified = True
 
         if modified:
-            await self.data_store.add_task(task)
+            task = await self.data_store.add_task(task)
 
         return task
 
@@ -705,6 +705,7 @@ class AsyncScheduler:
         task = await self.configure_task(func_or_task_id)
         job = Job(
             task_id=task.id,
+            task_revision=task.revision,
             args=args or (),
             kwargs=kwargs or {},
             executor=task.job_executor if job_executor is unset else job_executor,
@@ -972,6 +973,28 @@ class AsyncScheduler:
                     now = datetime.now(timezone.utc)
                     results: list[ScheduleResult] = []
                     for schedule in schedules:
+                        # Resolve the current task configuration generation that jobs
+                        # created from this schedule will be bound to
+                        try:
+                            task = await self.data_store.get_task(schedule.task_id)
+                        except TaskLookupError:
+                            self.logger.error(
+                                "Cannot add jobs for schedule %r – task %r has been "
+                                "removed",
+                                schedule.id,
+                                schedule.task_id,
+                            )
+                            results.append(
+                                ScheduleResult(
+                                    schedule_id=schedule.id,
+                                    task_id=schedule.task_id,
+                                    trigger=schedule.trigger,
+                                    last_fire_time=schedule.next_fire_time,
+                                    next_fire_time=schedule.trigger.next(),
+                                )
+                            )
+                            continue
+
                         # Calculate a next fire time for the schedule, if possible
                         fire_times = [schedule.next_fire_time]
                         calculate_next = schedule.trigger.next
@@ -1039,6 +1062,7 @@ class AsyncScheduler:
 
                             job = Job(
                                 task_id=schedule.task_id,
+                                task_revision=task.revision,
                                 args=schedule.args,
                                 kwargs=schedule.kwargs,
                                 schedule_id=schedule.id,
@@ -1089,26 +1113,39 @@ class AsyncScheduler:
                     self.logger.debug("Processing more schedules on the next iteration")
 
     def _get_task_callable(self, task: Task) -> Callable:
-        try:
-            return self._task_callables[task.id]
-        except KeyError as exc:
-            if task.func:
-                try:
-                    func = self._task_callables[task.id] = callable_from_ref(task.func)
-                except DeserializationError as exc:
-                    raise CallableLookupError(
-                        f"Error looking up the callable ({task.func!r}) for task "
-                        f"{task.id!r}"
-                    ) from exc
+        # If a callable has been registered locally for this task, use it only if it
+        # matches the callable reference of the task configuration generation that the
+        # job was bound to (otherwise fall back to importing the bound reference, so
+        # queued jobs keep using the function that was configured when they were
+        # created)
+        callable_obj = self._task_callables.get(task.id)
+        if callable_obj is not None:
+            if task.func is None:
+                return callable_obj
 
-                return func
+            try:
+                if callable_to_ref(callable_obj) == task.func:
+                    return callable_obj
+            except SerializationError:
+                return callable_obj
 
-            raise CallableLookupError(
-                f"Task {task.id} requires a locally defined callable to be run, but no "
-                f"such callable has been defined. Call "
-                f"scheduler.configure_task({task.id!r}, func=...) to define the local "
-                f"callable."
-            ) from exc
+        if task.func:
+            try:
+                func = callable_from_ref(task.func)
+            except DeserializationError as exc:
+                raise CallableLookupError(
+                    f"Error looking up the callable ({task.func!r}) for task "
+                    f"{task.id!r}"
+                ) from exc
+
+            return func
+
+        raise CallableLookupError(
+            f"Task {task.id} requires a locally defined callable to be run, but no "
+            f"such callable has been defined. Call "
+            f"scheduler.configure_task({task.id!r}, func=...) to define the local "
+            f"callable."
+        )
 
     async def _process_jobs(self, *, task_status: TaskStatus[None]) -> None:
         wakeup_event = anyio.Event()
@@ -1158,7 +1195,17 @@ class AsyncScheduler:
                         self.identity, self.lease_duration, limit
                     )
                     for job in jobs:
-                        task = await self.data_store.get_task(job.task_id)
+                        # Resolve the task configuration generation that the job was
+                        # bound to when it was created
+                        try:
+                            task = await self.data_store.get_task(
+                                job.task_id, job.task_revision
+                            )
+                        except TaskLookupError:
+                            # Fall back to the current task definition if the bound
+                            # revision is gone (should not normally happen)
+                            task = await self.data_store.get_task(job.task_id)
+
                         func = self._get_task_callable(task)
                         self._running_jobs.add(job)
                         task_group.start_soon(
